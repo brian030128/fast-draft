@@ -5,3 +5,7 @@
 [submodule "3rdparty/sglang"]
 	path = 3rdparty/sglang
 	url = git@github.com:brian030128/sglang.git
+[submodule "3rdparty/MagicDec"]
+	path = 3rdparty/MagicDec
+	url = git@github.com:brian030128/MagicDec.git
+	branch = fast-draft
