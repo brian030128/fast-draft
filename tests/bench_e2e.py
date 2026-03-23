@@ -1,9 +1,9 @@
 """E2E benchmark: original vs flat-EAGLE vs cascade-EAGLE draft decode.
 
 Three phases:
-  1. Original — vanilla autoregressive decoding (no speculation)
+  1. Cascade  — EAGLE speculative decoding with cascade draft attention
   2. Flat     — EAGLE speculative decoding with standard flat attention
-  3. Cascade  — EAGLE speculative decoding with cascade draft attention
+  3. Original — vanilla autoregressive decoding (no speculation)
 
 Uses random token IDs so arbitrarily long prompts can be tested without
 needing a dataset.
@@ -42,6 +42,7 @@ def make_random_input_ids(length: int, vocab_size: int = 128000, seed: int = 42)
 def create_engine(
     model_path: str,
     draft_model_path: str = None,
+    speculative_algorithm: str = "STANDALONE",
     eagle_topk: int = None,
     speculative_num_steps: int = None,
     tp: int = 1,
@@ -63,7 +64,7 @@ def create_engine(
         kwargs["mem_fraction_static"] = mem_fraction_static
 
     if draft_model_path is not None:
-        kwargs["speculative_algorithm"] = "STANDALONE"
+        kwargs["speculative_algorithm"] = speculative_algorithm
         kwargs["speculative_draft_model_path"] = draft_model_path
         # sglang requires all three spec params to be None (auto) or all set
         if eagle_topk is not None or speculative_num_steps is not None:
@@ -109,6 +110,7 @@ def run_phase(args, phase: str):
     engine = create_engine(
         model_path=args.model_path,
         draft_model_path=draft,
+        speculative_algorithm=args.speculative_algorithm,
         eagle_topk=topk,
         speculative_num_steps=num_steps,
         tp=args.tp,
@@ -200,6 +202,8 @@ def run_phase(args, phase: str):
                 "decode_throughput": decode_tps,
                 "spec_verify_ct": spec_verify_ct,
                 "accept_length": accept_length,
+                "eagle_topk": (args.eagle_topk or 4) if phase != "original" else None,
+                "speculative_num_steps": (args.speculative_num_steps or 10) if phase != "original" else None,
             })
 
         # Get server-reported throughput
@@ -249,6 +253,9 @@ def print_results(all_results, prompt_lengths):
             "mean_decode_tps": sum(r["decode_throughput"] for r in items) / n,
             "mean_latency": total_e2e / n,
             "mean_accept": sum(r["accept_length"] for r in items) / n,
+            "mean_output_tokens": total_comp / n,
+            "eagle_topk": items[0].get("eagle_topk"),
+            "speculative_num_steps": items[0].get("speculative_num_steps"),
         }
 
     prompt_lens = sorted(set(int(x) for x in prompt_lengths))
@@ -257,13 +264,26 @@ def print_results(all_results, prompt_lengths):
         if any(r["phase"] == p for r in all_results):
             phases_present.append(p)
 
+    # Extract shared params from first spec phase
+    spec_data = next((agg[k] for k in agg if k[0] in ("flat", "cascade")), None)
+    topk_val = spec_data["eagle_topk"] if spec_data else "-"
+    depth_val = spec_data["speculative_num_steps"] if spec_data else "-"
+    # mean output tokens (use first available phase)
+    first_data = next(iter(agg.values()), None)
+    out_tok_val = f"{first_data['mean_output_tokens']:.0f}" if first_data else "-"
+    n_val = first_data["n"] if first_data else "-"
+
     print(f"\n{'='*120}")
     print(f"  E2E Benchmark Results")
     print(f"{'='*120}")
-    print(f"  {'prompt':>7}  {'phase':>9}  {'n':>3}  {'lat(s)':>8}  "
+    print(f"  topk={topk_val}  depth={depth_val}  "
+          f"out_tokens={out_tok_val}  n={n_val}  "
+          f"prompt_lengths={','.join(str(p) for p in prompt_lens)}")
+    print(f"{'-'*120}")
+    print(f"  {'prompt':>7}  {'phase':>9}  {'lat(s)':>8}  "
           f"{'e2e tok/s':>10}  {'dec tok/s':>10}  {'accept':>7}  "
           f"{'dec vs orig':>11}  {'dec vs flat':>11}")
-    print(f"  {'-'*7}  {'-'*9}  {'-'*3}  {'-'*8}  "
+    print(f"  {'-'*7}  {'-'*9}  {'-'*8}  "
           f"{'-'*10}  {'-'*10}  {'-'*7}  "
           f"{'-'*11}  {'-'*11}")
 
@@ -281,7 +301,7 @@ def print_results(all_results, prompt_lengths):
                 flat = agg.get(("flat", pl))
                 if flat and flat["mean_decode_tps"] > 0:
                     vs_flat = f"{data['mean_decode_tps'] / flat['mean_decode_tps']:.2f}x"
-            print(f"  {pl:>7}  {phase:>9}  {data['n']:>3}  "
+            print(f"  {pl:>7}  {phase:>9}  "
                   f"{data['mean_latency']:>8.2f}  {data['mean_e2e_tps']:>10.1f}  "
                   f"{data['mean_decode_tps']:>10.1f}  {data['mean_accept']:>7.2f}  "
                   f"{vs_orig:>11}  {vs_flat:>11}")
@@ -297,6 +317,8 @@ def add_common_args(parser):
                         help="EAGLE draft model path")
     parser.add_argument("--prompt-lengths", default="2048",
                         help="Comma-separated prompt lengths")
+    parser.add_argument("--speculative-algorithm", default="STANDALONE",
+                        help="Speculative decoding algorithm (default: STANDALONE)")
     parser.add_argument("--eagle-topk", type=int, default=None,
                         help="EAGLE topk (default: auto-chosen by sglang)")
     parser.add_argument("--speculative-num-steps", type=int, default=None,
@@ -356,11 +378,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade"]
+    phases = ["cascade", "flat", "original"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade"]
+        phases = ["cascade", "flat"]
 
     # Forward all original argv (minus script name) to subprocesses
     forwarded_argv = sys.argv[1:]

@@ -1,0 +1,41 @@
+[project]
+name = "fast-draft"
+version = "0.1.0"
+description = "Cascade draft attention for SGLang EAGLE speculative decoding"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.4",
+    "triton>=3.0",
+    "requests",
+    "pytest",
+    "sglang",
+    "flashinfer-python",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+sglang = { path = "3rdparty/sglang/python", editable = true }
+flashinfer-python = { path = "3rdparty/flashinfer", editable = true }
+torch = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'" },
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'" },
+]
+
+[tool.uv]
+override-dependencies = ["flashinfer-python>=0.2"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
