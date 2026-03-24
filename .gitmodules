@@ -9,3 +9,6 @@
 	path = 3rdparty/MagicDec
 	url = git@github.com:brian030128/MagicDec.git
 	branch = fast-draft
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = git@github.com:brian030128/vllm.git
