@@ -11,4 +11,4 @@
 	branch = fast-draft
 [submodule "3rdparty/vllm"]
 	path = 3rdparty/vllm
-	url = git@github.com:brian030128/vllm.git
+	url = git@github.com:shadowpa0327/vllm.git
