@@ -20,6 +20,7 @@ Usage:
         --mem-fraction-static 0.40 \
         --batch-size 1 \
         --tp 2
+    CUDA_VISIBLE_DEVICES=3,2 uv run python tests/bench_e2e.py --model-path Qwen/Qwen3-4B  --draft-model-path brian920128/Qwen3-4B_eagle3 --prompt-lengths 30000 --eagle-topk 10  --max-new-tokens 512  --num-requests 1  --context-length 31000 --mem-fraction-static 0.40 --batch-size 1  --tp 2 --speculative-algorithm EAGLE3 --speculative-num-steps 4
 """
 
 import argparse
@@ -86,6 +87,12 @@ def run_phase(args, phase: str):
     # Allow long context
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
+    # Enable draft/verify timing (requires torch.cuda.synchronize, adds overhead)
+    if getattr(args, 'time_spec', False) and phase != "original":
+        os.environ["SGLANG_TIME_SPEC"] = "1"
+    else:
+        os.environ.pop("SGLANG_TIME_SPEC", None)
+
     # Clean prometheus state for multi-engine runs in same process
     try:
         from prometheus_client import REGISTRY
@@ -118,55 +125,84 @@ def run_phase(args, phase: str):
         mem_fraction_static=args.mem_fraction_static,
     )
 
-    prompt_lengths = [int(x) for x in args.prompt_lengths.split(",")]
+    # Build prompt groups: list of (group_label, input_ids_list)
+    if args.dataset_path:
+        max_prompt_tokens = None
+        if args.context_length is not None:
+            max_prompt_tokens = args.context_length - args.max_new_tokens
+        dataset_ids = load_dataset_input_ids(
+            args.dataset_path, args.model_path,
+            num_samples=args.num_samples,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+        lens = [len(ids) for ids in dataset_ids]
+        print(f"  Loaded {len(dataset_ids)} prompts from {args.dataset_path} "
+              f"(lengths: {min(lens)}-{max(lens)})")
+        # Single group with all dataset prompts
+        prompt_groups = [("dataset", dataset_ids)]
+    else:
+        prompt_groups = []
+        for pl in [int(x) for x in args.prompt_lengths.split(",")]:
+            ids_batch = [
+                make_random_input_ids(pl, seed=42 + i)
+                for i in range(args.num_requests)
+            ]
+            prompt_groups.append((pl, ids_batch))
+
     results = []
 
-    for prompt_len in prompt_lengths:
-        # Build batch of random-token prompts
-        input_ids_batch = [
-            make_random_input_ids(prompt_len, seed=42 + i)
-            for i in range(args.num_requests)
-        ]
+    for prompt_len, input_ids_batch in prompt_groups:
         sampling_params = {
             "temperature": 0,
             "max_new_tokens": args.max_new_tokens,
             "ignore_eos": True,
         }
 
+        num_requests = len(input_ids_batch)
+
         # Warmup
         print(f"  Warmup (prompt_len={prompt_len}) ...")
-        warmup_ids = make_random_input_ids(min(256, prompt_len), seed=99)
+        warmup_ids = input_ids_batch[0][:256]
         engine.generate(
             input_ids=warmup_ids,
             sampling_params={"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
         )
 
-        # Measure TTFT (prefill time) per request via max_new_tokens=1
-        print(f"  Measuring TTFT ...")
+        # TTFT: measure per-phase (speculative engines have different prefill cost)
         ttft_params = {"temperature": 0, "max_new_tokens": 1, "ignore_eos": True}
         ttfts = []
-        for i in range(args.num_requests):
-            out = engine.generate(input_ids=input_ids_batch[i], sampling_params=ttft_params)
-            ttfts.append(out["meta_info"].get("e2e_latency", 0))
+        print(f"  Measuring TTFT ...")
+        for i in range(num_requests):
+            ttft_ids = list(input_ids_batch[i])
+            random.Random(10000 + i).shuffle(ttft_ids)
+            t_start = time.perf_counter()
+            engine.generate(input_ids=ttft_ids, sampling_params=ttft_params)
+            ttfts.append(time.perf_counter() - t_start)
 
-        # Timed run — send requests in batch_size chunks
+        # Timed run — send requests one at a time with wall-clock timing
         print(f"  Benchmarking prompt_len={prompt_len}, "
-              f"num_requests={args.num_requests}, "
+              f"num_requests={num_requests}, "
               f"max_new_tokens={args.max_new_tokens} ...")
 
         batch_outputs = []
+        request_e2es = []
         t0 = time.perf_counter()
-        for batch_start in range(0, args.num_requests, args.batch_size):
-            batch_end = min(batch_start + args.batch_size, args.num_requests)
+        for batch_start in range(0, num_requests, args.batch_size):
+            batch_end = min(batch_start + args.batch_size, num_requests)
             batch_ids = input_ids_batch[batch_start:batch_end]
             batch_params = [sampling_params] * len(batch_ids)
 
+            t_req = time.perf_counter()
             if len(batch_ids) == 1:
                 out = engine.generate(input_ids=batch_ids[0], sampling_params=sampling_params)
                 batch_outputs.append(out)
             else:
                 out = engine.generate(input_ids=batch_ids, sampling_params=batch_params)
                 batch_outputs.extend(out)
+            req_elapsed = time.perf_counter() - t_req
+            # Distribute wall-clock time evenly across requests in this batch
+            for _ in range(batch_end - batch_start):
+                request_e2es.append(req_elapsed / (batch_end - batch_start))
         elapsed = time.perf_counter() - t0
 
         total_input_tokens = sum(len(ids) for ids in input_ids_batch)
@@ -178,16 +214,19 @@ def run_phase(args, phase: str):
         for i, out in enumerate(batch_outputs):
             meta = out["meta_info"]
             completion_tokens = meta.get("completion_tokens", 0)
-            e2e = meta.get("e2e_latency", elapsed / args.num_requests)
+            e2e = request_e2es[i]
             spec_verify_ct = meta.get("spec_verify_ct", 0)
             accept_length = meta.get("spec_accept_length", 0)
             if accept_length == 0 and spec_verify_ct > 0:
                 accept_length = completion_tokens / spec_verify_ct
 
-            # Decode time = e2e minus measured TTFT (prefill)
+            # Decode time = wall-clock e2e minus wall-clock TTFT
             ttft = ttfts[i] if i < len(ttfts) else 0
-            decode_time = max(e2e - ttft, 1e-6)
+            decode_time = max(e2e - ttft, 0.01)
             decode_tps = completion_tokens / decode_time
+
+            draft_time = meta.get("spec_draft_time", 0)
+            verify_time = meta.get("spec_verify_time", 0)
 
             results.append({
                 "phase": phase,
@@ -198,6 +237,8 @@ def run_phase(args, phase: str):
                 "e2e_latency_s": e2e,
                 "ttft_s": ttft,
                 "decode_time_s": decode_time,
+                "draft_time_s": draft_time,
+                "verify_time_s": verify_time,
                 "tokens_per_sec": completion_tokens / e2e if e2e > 0 else 0,
                 "decode_throughput": decode_tps,
                 "spec_verify_ct": spec_verify_ct,
@@ -251,6 +292,10 @@ def print_results(all_results, prompt_lengths):
             "total_e2e": total_e2e,
             "mean_e2e_tps": sum(r["tokens_per_sec"] for r in items) / n,
             "mean_decode_tps": sum(r["decode_throughput"] for r in items) / n,
+            "mean_ttft": sum(r["ttft_s"] for r in items) / n,
+            "mean_decode_time": sum(r["decode_time_s"] for r in items) / n,
+            "mean_draft_time": sum(r["draft_time_s"] for r in items) / n,
+            "mean_verify_time": sum(r["verify_time_s"] for r in items) / n,
             "mean_latency": total_e2e / n,
             "mean_accept": sum(r["accept_length"] for r in items) / n,
             "mean_output_tokens": total_comp / n,
@@ -280,10 +325,12 @@ def print_results(all_results, prompt_lengths):
           f"out_tokens={out_tok_val}  n={n_val}  "
           f"prompt_lengths={','.join(str(p) for p in prompt_lens)}")
     print(f"{'-'*120}")
-    print(f"  {'prompt':>7}  {'phase':>9}  {'lat(s)':>8}  "
+    print(f"  {'prompt':>7}  {'phase':>9}  {'lat(s)':>8}  {'ttft(s)':>8}  {'dec(s)':>8}  "
+          f"{'draft(s)':>8}  {'verify(s)':>9}  "
           f"{'e2e tok/s':>10}  {'dec tok/s':>10}  {'accept':>7}  "
           f"{'dec vs orig':>11}  {'dec vs flat':>11}")
-    print(f"  {'-'*7}  {'-'*9}  {'-'*8}  "
+    print(f"  {'-'*7}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*8}  "
+          f"{'-'*8}  {'-'*9}  "
           f"{'-'*10}  {'-'*10}  {'-'*7}  "
           f"{'-'*11}  {'-'*11}")
 
@@ -301,8 +348,12 @@ def print_results(all_results, prompt_lengths):
                 flat = agg.get(("flat", pl))
                 if flat and flat["mean_decode_tps"] > 0:
                     vs_flat = f"{data['mean_decode_tps'] / flat['mean_decode_tps']:.2f}x"
+            draft_str = f"{data['mean_draft_time']:>8.2f}" if data['mean_draft_time'] > 0 else f"{'—':>8}"
+            verify_str = f"{data['mean_verify_time']:>9.2f}" if data['mean_verify_time'] > 0 else f"{'—':>9}"
             print(f"  {pl:>7}  {phase:>9}  "
-                  f"{data['mean_latency']:>8.2f}  {data['mean_e2e_tps']:>10.1f}  "
+                  f"{data['mean_latency']:>8.2f}  {data['mean_ttft']:>8.2f}  {data['mean_decode_time']:>8.2f}  "
+                  f"{draft_str}  {verify_str}  "
+                  f"{data['mean_e2e_tps']:>10.1f}  "
                   f"{data['mean_decode_tps']:>10.1f}  {data['mean_accept']:>7.2f}  "
                   f"{vs_orig:>11}  {vs_flat:>11}")
         if pl != prompt_lens[-1]:
@@ -311,12 +362,38 @@ def print_results(all_results, prompt_lengths):
     print(f"{'='*120}")
 
 
+def load_dataset_input_ids(dataset_path, model_path, num_samples=None,
+                           max_prompt_tokens=None):
+    """Load JSONL dataset and pre-tokenize. Returns list of (input_ids, token_len)."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    results = []
+    with open(dataset_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            ids = tokenizer.encode(rec["prompt"])
+            if max_prompt_tokens is not None and len(ids) > max_prompt_tokens:
+                ids = ids[:max_prompt_tokens]
+            results.append(ids)
+            if num_samples and len(results) >= num_samples:
+                break
+    return results
+
+
 def add_common_args(parser):
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--draft-model-path", required=True,
                         help="EAGLE draft model path")
     parser.add_argument("--prompt-lengths", default="2048",
-                        help="Comma-separated prompt lengths")
+                        help="Comma-separated prompt lengths (ignored with --dataset-path)")
+    parser.add_argument("--dataset-path", default=None,
+                        help="Path to JSONL dataset file (overrides --prompt-lengths)")
+    parser.add_argument("--num-samples", type=int, default=None,
+                        help="Limit number of prompts from dataset")
     parser.add_argument("--speculative-algorithm", default="STANDALONE",
                         help="Speculative decoding algorithm (default: STANDALONE)")
     parser.add_argument("--eagle-topk", type=int, default=None,
@@ -335,6 +412,8 @@ def add_common_args(parser):
                         help="Skip the original (no speculation) phase")
     parser.add_argument("--result-file", default=None,
                         help="Write JSON results to file")
+    parser.add_argument("--time-spec", action="store_true",
+                        help="Enable draft/verify timing (adds torch.cuda.synchronize overhead)")
 
 
 def run_phase_subprocess(phase: str, argv: list[str]) -> list[dict]:
@@ -344,7 +423,7 @@ def run_phase_subprocess(phase: str, argv: list[str]) -> list[dict]:
 
     cmd = [sys.executable, __file__, "--_run-phase", phase,
            "--_result-path", result_path] + argv
-    proc = subprocess.run(cmd, timeout=600)
+    proc = subprocess.run(cmd, timeout=3600)
     if proc.returncode != 0:
         print(f"\n  Phase {phase} failed (exit {proc.returncode})")
         return []
@@ -378,11 +457,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["cascade", "flat", "original"]
+    phases = ["original", "flat", "cascade"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["cascade", "flat"]
+        phases = ["flat", "cascade"]
 
     # Forward all original argv (minus script name) to subprocesses
     forwarded_argv = sys.argv[1:]
@@ -392,7 +471,10 @@ def main():
         results = run_phase_subprocess(phase, forwarded_argv)
         all_results.extend(results)
 
-    prompt_lengths = [int(x) for x in args.prompt_lengths.split(",")]
+    if args.dataset_path:
+        prompt_lengths = ["dataset"]
+    else:
+        prompt_lengths = [int(x) for x in args.prompt_lengths.split(",")]
     print_results(all_results, prompt_lengths)
 
     if args.result_file:
