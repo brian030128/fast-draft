@@ -221,10 +221,106 @@ def run_benchmark(
     return result
 
 
+def run_ar_benchmark(
+    model: str,
+    prompt_ids: list[int],
+    output_len: int,
+    num_requests: int,
+    max_model_len: int,
+    enforce_eager: bool,
+    gpu_mem_util: float,
+    max_num_batched_tokens: Optional[int] = None,
+) -> dict:
+    """Run autoregressive (no speculative decoding) benchmark."""
+    print(f"\n{'='*60}")
+    print(f"  Mode: AUTOREGRESSIVE (no spec decode)")
+    print(f"{'='*60}\n")
+
+    llm = LLM(
+        model=model,
+        trust_remote_code=True,
+        enforce_eager=enforce_eager,
+        gpu_memory_utilization=gpu_mem_util,
+        max_model_len=max_model_len,
+        disable_log_stats=False,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+    sampling_params = SamplingParams(temperature=0, max_tokens=output_len)
+    prompts = [TokensPrompt(prompt_token_ids=prompt_ids)] * num_requests
+
+    # Warmup
+    print("Warmup run...")
+    _ = llm.generate(prompts[:1], sampling_params=sampling_params)
+
+    # Timed run
+    print(f"Benchmark run ({num_requests} requests)...")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    total_output_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+
+    # Collect metrics
+    ttft_sum = 0.0
+    ttft_count = 0
+    prefill_time_sum = 0.0
+    prefill_count = 0
+    decode_time_sum = 0.0
+    decode_count = 0
+    try:
+        from vllm.v1.metrics.reader import Counter, Histogram
+        metrics = llm.get_metrics()
+        for m in metrics:
+            if m.name == "vllm:time_to_first_token_seconds" and isinstance(m, Histogram):
+                ttft_sum += m.sum
+                ttft_count += m.count
+            elif m.name == "vllm:request_prefill_time_seconds" and isinstance(m, Histogram):
+                prefill_time_sum += m.sum
+                prefill_count += m.count
+            elif m.name == "vllm:request_decode_time_seconds" and isinstance(m, Histogram):
+                decode_time_sum += m.sum
+                decode_count += m.count
+    except Exception:
+        pass
+
+    mean_ttft = ttft_sum / ttft_count if ttft_count > 0 else float("nan")
+    mean_prefill = prefill_time_sum / prefill_count if prefill_count > 0 else float("nan")
+    mean_decode = decode_time_sum / decode_count if decode_count > 0 else float("nan")
+
+    result = {
+        "mode": "ar",
+        "elapsed_s": elapsed,
+        "num_requests": num_requests,
+        "prompt_length": len(prompt_ids),
+        "total_output_tokens": total_output_tokens,
+        "tokens_per_sec": total_output_tokens / elapsed if elapsed > 0 else 0,
+        "mean_ttft_s": mean_ttft,
+        "mean_prefill_s": mean_prefill,
+        "mean_decode_s": mean_decode,
+    }
+
+    print(f"\n--- AUTOREGRESSIVE Results ---")
+    print(f"  TTFT:           {mean_ttft:.3f}s")
+    print(f"  Prefill time:   {mean_prefill:.3f}s")
+    print(f"  Decode time:    {mean_decode:.3f}s")
+    print(f"  Total time:     {elapsed:.2f}s")
+    print(f"  Output tokens:  {total_output_tokens}")
+    print(f"  Throughput:     {result['tokens_per_sec']:.1f} tok/s")
+
+    del llm
+    torch.cuda.empty_cache()
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="vLLM EAGLE Tree Draft Benchmark")
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--draft-model", type=str, required=True)
+    parser.add_argument("--draft-model", type=str, default=None,
+                        help="Draft model (required for spec decode modes)")
     parser.add_argument("--method", type=str, default="eagle3",
                         choices=["eagle", "eagle3"])
     parser.add_argument("--prompt-length", type=int, default=50000)
@@ -238,11 +334,14 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=None,
                         help="Max tokens per batch (default: auto)")
     parser.add_argument("--only", type=str, default=None,
-                        choices=["original", "cascade"],
-                        help="Run only one mode")
+                        choices=["original", "cascade", "ar"],
+                        help="Run only one mode (ar=autoregressive, no spec decode)")
     parser.add_argument("--result-file", type=str, default=None,
                         help="Save results to JSON file")
     args = parser.parse_args()
+
+    if args.only != "ar" and args.draft_model is None:
+        parser.error("--draft-model is required for spec decode modes")
 
     # Set TREE_ATTN backend
     os.environ["VLLM_ATTENTION_BACKEND"] = "TREE_ATTN"
@@ -263,28 +362,40 @@ def main():
         # Single mode: run in-process
         modes = [args.only]
     else:
-        # Both modes: run each in a subprocess for clean GPU memory
-        modes = ["original", "cascade"]
+        # All modes: run each in a subprocess for clean GPU memory
+        modes = ["ar", "original", "cascade"]
 
     for mode in modes:
         if args.only is not None:
             # In-process path
-            os.environ["VLLM_CASCADE_DRAFT"] = "1" if mode == "cascade" else "0"
-            r = run_benchmark(
-                model=args.model,
-                draft_model=args.draft_model,
-                method=args.method,
-                prompt_ids=prompt_ids,
-                tree_choices=tree_choices,
-                num_spec_tokens=num_spec_tokens,
-                output_len=args.output_len,
-                num_requests=args.num_requests,
-                max_model_len=args.max_model_len,
-                enforce_eager=args.enforce_eager,
-                gpu_mem_util=args.gpu_mem_util,
-                cascade=(mode == "cascade"),
-                max_num_batched_tokens=args.max_num_batched_tokens,
-            )
+            if mode == "ar":
+                r = run_ar_benchmark(
+                    model=args.model,
+                    prompt_ids=prompt_ids,
+                    output_len=args.output_len,
+                    num_requests=args.num_requests,
+                    max_model_len=args.max_model_len,
+                    enforce_eager=args.enforce_eager,
+                    gpu_mem_util=args.gpu_mem_util,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
+                )
+            else:
+                os.environ["VLLM_CASCADE_DRAFT"] = "1" if mode == "cascade" else "0"
+                r = run_benchmark(
+                    model=args.model,
+                    draft_model=args.draft_model,
+                    method=args.method,
+                    prompt_ids=prompt_ids,
+                    tree_choices=tree_choices,
+                    num_spec_tokens=num_spec_tokens,
+                    output_len=args.output_len,
+                    num_requests=args.num_requests,
+                    max_model_len=args.max_model_len,
+                    enforce_eager=args.enforce_eager,
+                    gpu_mem_util=args.gpu_mem_util,
+                    cascade=(mode == "cascade"),
+                    max_num_batched_tokens=args.max_num_batched_tokens,
+                )
         else:
             # Subprocess path: re-invoke with --only and --result-file
             import tempfile
@@ -322,27 +433,49 @@ def main():
         results.append(r)
 
     # Summary
-    if len(results) == 2:
-        orig, casc = results
+    by_mode = {r["mode"]: r for r in results}
+    spec_modes = [m for m in ["original", "cascade"] if m in by_mode]
+
+    if len(spec_modes) == 2:
+        orig, casc = by_mode["original"], by_mode["cascade"]
         speedup = orig["elapsed_s"] / casc["elapsed_s"] if casc["elapsed_s"] > 0 else float("nan")
         decode_speedup = orig["mean_decode_s"] / casc["mean_decode_s"] if casc["mean_decode_s"] > 0 else float("nan")
         draft_speedup = orig["mean_draft_s"] / casc["mean_draft_s"] if casc["mean_draft_s"] > 0 else float("nan")
         verify_speedup = orig["mean_verify_s"] / casc["mean_verify_s"] if casc["mean_verify_s"] > 0 else float("nan")
-        print(f"\n{'='*60}")
-        print(f"  SUMMARY  (prompt={orig['prompt_length']} tokens)")
-        print(f"{'='*60}")
-        print(f"  {'':20s} {'Original':>12s} {'Cascade':>12s} {'Speedup':>8s}")
-        print(f"  {'-'*52}")
-        print(f"  {'TTFT':20s} {orig['mean_ttft_s']:>11.3f}s {casc['mean_ttft_s']:>11.3f}s")
-        print(f"  {'Prefill':20s} {orig['mean_prefill_s']:>11.3f}s {casc['mean_prefill_s']:>11.3f}s")
-        print(f"  {'Decode (draft+vfy)':20s} {orig['mean_decode_s']:>11.3f}s {casc['mean_decode_s']:>11.3f}s {decode_speedup:>7.2f}x")
-        print(f"  {'  Draft':20s} {orig['mean_draft_s']:>11.3f}s {casc['mean_draft_s']:>11.3f}s {draft_speedup:>7.2f}x")
-        print(f"  {'  Verify':20s} {orig['mean_verify_s']:>11.3f}s {casc['mean_verify_s']:>11.3f}s {verify_speedup:>7.2f}x")
-        print(f"  {'Total':20s} {orig['elapsed_s']:>11.2f}s {casc['elapsed_s']:>11.2f}s {speedup:>7.2f}x")
-        print(f"  {'Output tok/s':20s} {orig['tokens_per_sec']:>11.1f}  {casc['tokens_per_sec']:>11.1f}")
-        print(f"  {'Draft tok/s':20s} {orig['draft_tokens_per_sec']:>11.1f}  {casc['draft_tokens_per_sec']:>11.1f}")
-        print(f"  {'Mean accept len':20s} {orig['mean_accept_len']:>11.2f}  {casc['mean_accept_len']:>11.2f}")
-        print(f"{'='*60}")
+        ar = by_mode.get("ar")
+        prompt_len = orig["prompt_length"]
+        print(f"\n{'='*72}")
+        print(f"  SUMMARY  (prompt={prompt_len} tokens)")
+        print(f"{'='*72}")
+        if ar:
+            print(f"  {'':20s} {'AR':>10s} {'Original':>12s} {'Cascade':>12s} {'Speedup':>8s}")
+            print(f"  {'-'*62}")
+            print(f"  {'TTFT':20s} {ar['mean_ttft_s']:>9.3f}s {orig['mean_ttft_s']:>11.3f}s {casc['mean_ttft_s']:>11.3f}s")
+            print(f"  {'Prefill':20s} {ar['mean_prefill_s']:>9.3f}s {orig['mean_prefill_s']:>11.3f}s {casc['mean_prefill_s']:>11.3f}s")
+            print(f"  {'Decode':20s} {ar['mean_decode_s']:>9.3f}s {orig['mean_decode_s']:>11.3f}s {casc['mean_decode_s']:>11.3f}s {decode_speedup:>7.2f}x")
+            print(f"  {'  Draft':20s} {'':>10s} {orig['mean_draft_s']:>11.3f}s {casc['mean_draft_s']:>11.3f}s {draft_speedup:>7.2f}x")
+            print(f"  {'  Verify':20s} {'':>10s} {orig['mean_verify_s']:>11.3f}s {casc['mean_verify_s']:>11.3f}s {verify_speedup:>7.2f}x")
+            print(f"  {'Total':20s} {ar['elapsed_s']:>9.2f}s {orig['elapsed_s']:>11.2f}s {casc['elapsed_s']:>11.2f}s {speedup:>7.2f}x")
+            print(f"  {'Output tok/s':20s} {ar['tokens_per_sec']:>9.1f}  {orig['tokens_per_sec']:>11.1f}  {casc['tokens_per_sec']:>11.1f}")
+            print(f"  {'Draft tok/s':20s} {'':>10s} {orig['draft_tokens_per_sec']:>11.1f}  {casc['draft_tokens_per_sec']:>11.1f}")
+            print(f"  {'Mean accept len':20s} {'':>10s} {orig['mean_accept_len']:>11.2f}  {casc['mean_accept_len']:>11.2f}")
+            ar_vs_casc = ar["elapsed_s"] / casc["elapsed_s"] if casc["elapsed_s"] > 0 else float("nan")
+            ar_vs_orig = ar["elapsed_s"] / orig["elapsed_s"] if orig["elapsed_s"] > 0 else float("nan")
+            print(f"  {'-'*62}")
+            print(f"  Spec vs AR:  Original {ar_vs_orig:.2f}x,  Cascade {ar_vs_casc:.2f}x")
+        else:
+            print(f"  {'':20s} {'Original':>12s} {'Cascade':>12s} {'Speedup':>8s}")
+            print(f"  {'-'*52}")
+            print(f"  {'TTFT':20s} {orig['mean_ttft_s']:>11.3f}s {casc['mean_ttft_s']:>11.3f}s")
+            print(f"  {'Prefill':20s} {orig['mean_prefill_s']:>11.3f}s {casc['mean_prefill_s']:>11.3f}s")
+            print(f"  {'Decode (draft+vfy)':20s} {orig['mean_decode_s']:>11.3f}s {casc['mean_decode_s']:>11.3f}s {decode_speedup:>7.2f}x")
+            print(f"  {'  Draft':20s} {orig['mean_draft_s']:>11.3f}s {casc['mean_draft_s']:>11.3f}s {draft_speedup:>7.2f}x")
+            print(f"  {'  Verify':20s} {orig['mean_verify_s']:>11.3f}s {casc['mean_verify_s']:>11.3f}s {verify_speedup:>7.2f}x")
+            print(f"  {'Total':20s} {orig['elapsed_s']:>11.2f}s {casc['elapsed_s']:>11.2f}s {speedup:>7.2f}x")
+            print(f"  {'Output tok/s':20s} {orig['tokens_per_sec']:>11.1f}  {casc['tokens_per_sec']:>11.1f}")
+            print(f"  {'Draft tok/s':20s} {orig['draft_tokens_per_sec']:>11.1f}  {casc['draft_tokens_per_sec']:>11.1f}")
+            print(f"  {'Mean accept len':20s} {orig['mean_accept_len']:>11.2f}  {casc['mean_accept_len']:>11.2f}")
+        print(f"{'='*72}")
 
     if args.result_file:
         with open(args.result_file, "w") as f:
