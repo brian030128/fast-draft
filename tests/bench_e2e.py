@@ -46,6 +46,7 @@ def create_engine(
     speculative_algorithm: str = "STANDALONE",
     eagle_topk: int = None,
     speculative_num_steps: int = None,
+    speculative_num_draft_tokens: int = None,
     tp: int = 1,
     context_length: int = None,
     mem_fraction_static: float = None,
@@ -71,7 +72,7 @@ def create_engine(
         if eagle_topk is not None or speculative_num_steps is not None:
             kwargs["speculative_eagle_topk"] = eagle_topk or 4
             kwargs["speculative_num_steps"] = speculative_num_steps or 10
-            kwargs["speculative_num_draft_tokens"] = (speculative_num_steps or 10) + 3
+            kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens or (speculative_num_steps or 10) + 3
 
     return Engine(**kwargs)
 
@@ -120,6 +121,7 @@ def run_phase(args, phase: str):
         speculative_algorithm=args.speculative_algorithm,
         eagle_topk=topk,
         speculative_num_steps=num_steps,
+        speculative_num_draft_tokens=args.speculative_num_draft_tokens,
         tp=args.tp,
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
@@ -153,7 +155,7 @@ def run_phase(args, phase: str):
 
     for prompt_len, input_ids_batch in prompt_groups:
         sampling_params = {
-            "temperature": 0,
+            "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
             "ignore_eos": True,
         }
@@ -165,11 +167,11 @@ def run_phase(args, phase: str):
         warmup_ids = input_ids_batch[0][:256]
         engine.generate(
             input_ids=warmup_ids,
-            sampling_params={"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
+            sampling_params={"temperature": args.temperature, "max_new_tokens": 4, "ignore_eos": True},
         )
 
         # TTFT: measure per-phase (speculative engines have different prefill cost)
-        ttft_params = {"temperature": 0, "max_new_tokens": 1, "ignore_eos": True}
+        ttft_params = {"temperature": args.temperature, "max_new_tokens": 1, "ignore_eos": True}
         ttfts = []
         print(f"  Measuring TTFT ...")
         for i in range(num_requests):
@@ -400,6 +402,10 @@ def add_common_args(parser):
                         help="EAGLE topk (default: auto-chosen by sglang)")
     parser.add_argument("--speculative-num-steps", type=int, default=None,
                         help="Number of speculative steps (default: auto-chosen by sglang)")
+    parser.add_argument("--speculative-num-draft-tokens", type=int, default=None,
+                        help="Number of draft tokens to keep (default: num_steps + 3)")
+    parser.add_argument("--temperature", type=float, default=0.2,
+                        help="Sampling temperature (default: 0.2)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-requests", type=int, default=1)
     parser.add_argument("--context-length", type=int, default=None)
