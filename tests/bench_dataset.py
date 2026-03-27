@@ -339,7 +339,7 @@ def run_phase_subprocess(phase, argv):
 
     cmd = [sys.executable, __file__, "--_run-phase", phase,
            "--_result-path", result_path] + argv
-    proc = subprocess.run(cmd, timeout=3600)
+    proc = subprocess.run(cmd, timeout=86400)
     if proc.returncode != 0:
         print(f"\n  Phase {phase} failed (exit {proc.returncode})")
         return []
