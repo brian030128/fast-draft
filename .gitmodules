@@ -12,3 +12,9 @@
 [submodule "3rdparty/vllm"]
 	path = 3rdparty/vllm
 	url = git@github.com:shadowpa0327/vllm.git
+[submodule "3rdparty/DeFT"]
+	path = 3rdparty/DeFT
+	url = git@github.com:LINs-lab/DeFT.git
+[submodule "3rdparty/FastTree-Artifact"]
+	path = 3rdparty/FastTree-Artifact
+	url = git@github.com:brian030128/FastTree-Artifact.git
