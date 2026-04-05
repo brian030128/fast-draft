@@ -52,7 +52,6 @@ def create_engine(
     tp=1,
     context_length=None,
     mem_fraction_static=None,
-    disable_cuda_graph=False,
 ):
     """Create an sglang Engine with the given configuration."""
     from sglang.srt.entrypoints.engine import Engine
@@ -67,8 +66,6 @@ def create_engine(
         kwargs["context_length"] = context_length
     if mem_fraction_static is not None:
         kwargs["mem_fraction_static"] = mem_fraction_static
-    if disable_cuda_graph:
-        kwargs["disable_cuda_graph"] = True
 
     if draft_model_path is not None:
         kwargs["speculative_algorithm"] = speculative_algorithm
@@ -99,7 +96,7 @@ def csv_filename(phase, args):
     if phase == "original":
         return f"{prefix}{target}_{ds}.csv"
     else:
-        method = "cascade" if phase == "cascade" else "fasttree" if phase == "fasttree" else "paged"
+        method = "cascade" if phase == "cascade" else "cascade_no_cg" if phase == "cascade_no_cg" else "fasttree" if phase == "fasttree" else "paged"
         draft = model_short_name(args.draft_model_path)
         topk = args.eagle_topk or 4
         depth = args.speculative_num_steps or 10
@@ -108,15 +105,17 @@ def csv_filename(phase, args):
 
 def run_phase(args, phase, records):
     """Run one benchmark phase on the given records. Returns list of per-prompt result dicts."""
+    # Reset all draft env vars
+    os.environ["SGLANG_CASCADE_DRAFT"] = "0"
+    os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "0"
+    os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
+
     if phase == "cascade":
         os.environ["SGLANG_CASCADE_DRAFT"] = "1"
-        os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
+    elif phase == "cascade_no_cg":
+        os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "1"
     elif phase == "fasttree":
         os.environ["SGLANG_FASTTREE_DRAFT"] = "1"
-        os.environ["SGLANG_CASCADE_DRAFT"] = "0"
-    else:
-        os.environ["SGLANG_CASCADE_DRAFT"] = "0"
-        os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
 
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
@@ -143,6 +142,8 @@ def run_phase(args, phase, records):
     print(f"\n{'='*70}")
     if phase == "original":
         phase_info = "  (no speculation)"
+    elif phase == "cascade_no_cg":
+        phase_info = "  (SGLANG_CASCADE_DRAFT_NO_CG=1, no CUDA graph for attn)"
     elif phase == "fasttree":
         phase_info = f"  (SGLANG_FASTTREE_DRAFT={os.environ.get('SGLANG_FASTTREE_DRAFT', '0')})"
     else:
@@ -160,7 +161,6 @@ def run_phase(args, phase, records):
         tp=args.tp,
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
-        disable_cuda_graph=getattr(args, "disable_cuda_graph", False),
     )
 
     # Pre-tokenize all prompts and truncate to fit context_length - max_new_tokens
@@ -312,7 +312,7 @@ def print_summary(all_phase_results, args):
           f"{'-'*10}  {'-'*9}  {'-'*10}  "
           f"{'-'*8}  {'-'*7}  {'-'*8}  {'-'*9}")
 
-    for phase in ["original", "flat", "cascade"]:
+    for phase in ["original", "flat", "cascade_no_cg", "cascade"]:
         if phase not in phase_avgs:
             continue
         a = phase_avgs[phase]
@@ -322,7 +322,7 @@ def print_summary(all_phase_results, args):
         if orig_tps and phase != "original":
             vs_orig = f"{a['avg_throughput'] / orig_tps:.2f}x"
         vs_flat = ""
-        if flat_tps and phase == "cascade":
+        if flat_tps and phase in ("cascade", "cascade_no_cg"):
             vs_flat = f"{a['avg_throughput'] / flat_tps:.2f}x"
 
         draft_str = f"{a['avg_draft_time']:.3f}" if a['avg_draft_time'] > 0 else "-"
@@ -384,7 +384,7 @@ def add_common_args(parser):
     parser.add_argument("--batch-size", type=int, default=1,
                         help="(reserved for future batched inference)")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--only", choices=["original", "flat", "cascade", "fasttree"],
+    parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
     parser.add_argument("--time-spec", action="store_true",
@@ -393,8 +393,6 @@ def add_common_args(parser):
                         help="Directory for CSV output (default: results/)")
     parser.add_argument("--num-samples", type=int, default=None,
                         help="Limit number of prompts from the dataset")
-    parser.add_argument("--disable-cuda-graph", action="store_true",
-                        help="Disable CUDA graph capture")
     parser.add_argument("--result-prefix", default="",
                         help="Prefix for CSV filenames (e.g. 'wo_graph_')")
 
@@ -428,11 +426,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade"]
+    phases = ["original", "flat", "cascade_no_cg", "cascade"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade"]
+        phases = ["flat", "cascade_no_cg", "cascade"]
 
     forwarded_argv = sys.argv[1:]
 
