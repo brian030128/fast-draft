@@ -327,7 +327,7 @@ def bench_ms(func) -> float:
 def run_benchmark(
     num_prefixes_list: List[int],
     prefix_lens: List[int],
-    topk: int = 16,
+    topk_list: List[int] = None,
     suffix_len: int = 5,
     num_qo_heads: int = 32,
     num_kv_heads: int = 8,
@@ -335,208 +335,211 @@ def run_benchmark(
     dtype: torch.dtype = torch.float16,
     skip_methods: List[str] = None,
 ):
+    if topk_list is None:
+        topk_list = [4, 8, 16]
     skip = set(skip_methods or [])
     sm_scale = 1.0 / math.sqrt(head_dim)
     results = []
 
     for num_prefixes in num_prefixes_list:
         for prefix_len in prefix_lens:
-            print(f"\n--- num_prefixes={num_prefixes}, prefix_len={prefix_len}, topk={topk}, suffix_len={suffix_len} ---")
+            for topk in topk_list:
+                print(f"\n--- num_prefixes={num_prefixes}, prefix_len={prefix_len}, topk={topk}, suffix_len={suffix_len} ---")
 
-            tree_info = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
-            data = prepare_data(tree_info, num_qo_heads, num_kv_heads, head_dim, dtype)
-            batch_size = data["batch_size"]
-            q = data["q"]
-            kv_data = (data["k_tree"], data["v_tree"])
+                tree_info = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
+                data = prepare_data(tree_info, num_qo_heads, num_kv_heads, head_dim, dtype)
+                batch_size = data["batch_size"]
+                q = data["q"]
+                kv_data = (data["k_tree"], data["v_tree"])
 
-            row = {
-                "num_prefixes": num_prefixes,
-                "prefix_len": prefix_len,
-                "topk": topk,
-                "suffix_len": suffix_len,
-                "batch_size": batch_size,
-            }
+                row = {
+                    "num_prefixes": num_prefixes,
+                    "prefix_len": prefix_len,
+                    "topk": topk,
+                    "suffix_len": suffix_len,
+                    "batch_size": batch_size,
+                }
 
-            # ---- Flat FlashInfer ----
-            flat_out = None
-            if "flat" not in skip:
-                kv_indptr, kv_indices, kv_last_page_len, kv_lens = build_flashinfer_flat_indices(tree_info, data)
-                flat_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD",
-                )
-                flat_wrapper.plan(
-                    kv_indptr, kv_indices, kv_last_page_len,
-                    num_qo_heads, num_kv_heads, head_dim, 1,
-                    q_data_type=dtype,
-                )
-                flat_out = flat_wrapper.run(q, kv_data)
-                row["flat_ms"] = bench_ms(lambda: flat_wrapper.run(q, kv_data))
-                print(f"  flat:       {row['flat_ms']:.4f} ms")
-            else:
-                row["flat_ms"] = ""
-
-            # ---- Cascade FlashInfer ----
-            if "cascade" not in skip:
-                casc_idx = build_flashinfer_cascade_indices(tree_info, data, num_prefixes, topk)
-                q_casc = casc_idx["q_reorder"]
-                cascade = CascadeBatchAttentionWrapper(num_levels=2, kv_layout="NHD", device="cuda")
-                cascade.plan(
-                    qo_indptr_arr=casc_idx["qo_indptr_arr"],
-                    kv_indptr_arr=casc_idx["kv_indptr_arr"],
-                    kv_indices_arr=casc_idx["kv_indices_arr"],
-                    kv_len_arr=casc_idx["kv_len_arr"],
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim_qk=head_dim,
-                    head_dim_vo=head_dim,
-                    page_size=1,
-                    causal=False,
-                    q_data_type=dtype,
-                    kv_data_type=dtype,
-                )
-                casc_out_reordered, _ = cascade.run(q_casc, kv_data)
-                # Un-reorder to match flat output
-                inv_order = [0] * batch_size
-                for i, ri in enumerate(casc_idx["ordered_req_indices"]):
-                    inv_order[ri] = i
-                casc_out = casc_out_reordered[inv_order]
-
-                def run_cascade():
-                    cascade.run(q_casc, kv_data)
-                row["cascade_ms"] = bench_ms(run_cascade)
-                if flat_out is not None:
-                    row["cascade_diff"] = (flat_out - casc_out).abs().max().item()
+                # ---- Flat FlashInfer ----
+                flat_out = None
+                if "flat" not in skip:
+                    kv_indptr, kv_indices, kv_last_page_len, kv_lens = build_flashinfer_flat_indices(tree_info, data)
+                    flat_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD",
+                    )
+                    flat_wrapper.plan(
+                        kv_indptr, kv_indices, kv_last_page_len,
+                        num_qo_heads, num_kv_heads, head_dim, 1,
+                        q_data_type=dtype,
+                    )
+                    flat_out = flat_wrapper.run(q, kv_data)
+                    row["flat_ms"] = bench_ms(lambda: flat_wrapper.run(q, kv_data))
+                    print(f"  flat:       {row['flat_ms']:.4f} ms")
                 else:
-                    row["cascade_diff"] = ""
-                print(f"  cascade:    {row['cascade_ms']:.4f} ms  diff={row['cascade_diff']}")
-            else:
-                row["cascade_ms"] = ""
-                row["cascade_diff"] = ""
+                    row["flat_ms"] = ""
 
-            # ---- MultiLevel Cascade FlashInfer ----
-            if "ml_cascade" not in skip:
-                if "cascade" in skip:
+                # ---- Cascade FlashInfer ----
+                if "cascade" not in skip:
                     casc_idx = build_flashinfer_cascade_indices(tree_info, data, num_prefixes, topk)
-                q_casc = casc_idx["q_reorder"]
-                ml_cascade = MultiLevelCascadeAttentionWrapper(
-                    num_levels=2,
-                    float_workspace_buffer=torch.zeros(512 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-                    kv_layout="NHD",
-                )
-                ml_cascade.plan(
-                    qo_indptr_arr=casc_idx["qo_indptr_arr"],
-                    paged_kv_indptr_arr=casc_idx["kv_indptr_arr"],
-                    paged_kv_indices_arr=casc_idx["kv_indices_arr"],
-                    paged_kv_last_page_len=[casc_idx["shared_last_page_len"], casc_idx["unique_last_page_len"]],
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    page_size=1,
-                    causal=False,
-                    q_data_type=dtype,
-                    kv_data_type=dtype,
-                )
-                ml_out_reordered = ml_cascade.run(q_casc, kv_data)
-                inv_order = [0] * batch_size
-                for i, ri in enumerate(casc_idx["ordered_req_indices"]):
-                    inv_order[ri] = i
-                ml_out = ml_out_reordered[inv_order]
+                    q_casc = casc_idx["q_reorder"]
+                    cascade = CascadeBatchAttentionWrapper(num_levels=2, kv_layout="NHD", device="cuda")
+                    cascade.plan(
+                        qo_indptr_arr=casc_idx["qo_indptr_arr"],
+                        kv_indptr_arr=casc_idx["kv_indptr_arr"],
+                        kv_indices_arr=casc_idx["kv_indices_arr"],
+                        kv_len_arr=casc_idx["kv_len_arr"],
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim_qk=head_dim,
+                        head_dim_vo=head_dim,
+                        page_size=1,
+                        causal=False,
+                        q_data_type=dtype,
+                        kv_data_type=dtype,
+                    )
+                    casc_out_reordered, _ = cascade.run(q_casc, kv_data)
+                    # Un-reorder to match flat output
+                    inv_order = [0] * batch_size
+                    for i, ri in enumerate(casc_idx["ordered_req_indices"]):
+                        inv_order[ri] = i
+                    casc_out = casc_out_reordered[inv_order]
 
-                def run_ml_cascade():
-                    ml_cascade.run(q_casc, kv_data)
-                row["ml_cascade_ms"] = bench_ms(run_ml_cascade)
-                if flat_out is not None:
-                    row["ml_cascade_diff"] = (flat_out - ml_out).abs().max().item()
+                    def run_cascade():
+                        cascade.run(q_casc, kv_data)
+                    row["cascade_ms"] = bench_ms(run_cascade)
+                    if flat_out is not None:
+                        row["cascade_diff"] = (flat_out - casc_out).abs().max().item()
+                    else:
+                        row["cascade_diff"] = ""
+                    print(f"  cascade:    {row['cascade_ms']:.4f} ms  diff={row['cascade_diff']}")
                 else:
+                    row["cascade_ms"] = ""
+                    row["cascade_diff"] = ""
+
+                # ---- MultiLevel Cascade FlashInfer ----
+                if "ml_cascade" not in skip:
+                    if "cascade" in skip:
+                        casc_idx = build_flashinfer_cascade_indices(tree_info, data, num_prefixes, topk)
+                    q_casc = casc_idx["q_reorder"]
+                    ml_cascade = MultiLevelCascadeAttentionWrapper(
+                        num_levels=2,
+                        float_workspace_buffer=torch.zeros(512 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                        kv_layout="NHD",
+                    )
+                    ml_cascade.plan(
+                        qo_indptr_arr=casc_idx["qo_indptr_arr"],
+                        paged_kv_indptr_arr=casc_idx["kv_indptr_arr"],
+                        paged_kv_indices_arr=casc_idx["kv_indices_arr"],
+                        paged_kv_last_page_len=[casc_idx["shared_last_page_len"], casc_idx["unique_last_page_len"]],
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        page_size=1,
+                        causal=False,
+                        q_data_type=dtype,
+                        kv_data_type=dtype,
+                    )
+                    ml_out_reordered = ml_cascade.run(q_casc, kv_data)
+                    inv_order = [0] * batch_size
+                    for i, ri in enumerate(casc_idx["ordered_req_indices"]):
+                        inv_order[ri] = i
+                    ml_out = ml_out_reordered[inv_order]
+
+                    def run_ml_cascade():
+                        ml_cascade.run(q_casc, kv_data)
+                    row["ml_cascade_ms"] = bench_ms(run_ml_cascade)
+                    if flat_out is not None:
+                        row["ml_cascade_diff"] = (flat_out - ml_out).abs().max().item()
+                    else:
+                        row["ml_cascade_diff"] = ""
+                    print(f"  ml_cascade: {row['ml_cascade_ms']:.4f} ms  diff={row['ml_cascade_diff']}")
+                else:
+                    row["ml_cascade_ms"] = ""
                     row["ml_cascade_diff"] = ""
-                print(f"  ml_cascade: {row['ml_cascade_ms']:.4f} ms  diff={row['ml_cascade_diff']}")
-            else:
-                row["ml_cascade_ms"] = ""
-                row["ml_cascade_diff"] = ""
 
-            # ---- FastTree ----
-            if "fasttree" not in skip:
-                try:
-                    # Need a fresh tree_info copy since fasttree_preparation may mutate requests
-                    tree_info_ft = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
-                    data_ft = prepare_data(tree_info_ft, num_qo_heads, num_kv_heads, head_dim, dtype)
-                    q_ft = data_ft["q"].copy_(q)  # same Q values
+                # ---- FastTree ----
+                if "fasttree" not in skip:
+                    try:
+                        # Need a fresh tree_info copy since fasttree_preparation may mutate requests
+                        tree_info_ft = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
+                        data_ft = prepare_data(tree_info_ft, num_qo_heads, num_kv_heads, head_dim, dtype)
+                        q_ft = data_ft["q"].copy_(q)  # same Q values
 
-                    params = FastTreeParams()
-                    params.set_values(0.66, 0.33, 0.1)
-                    params.set_q_tile_sizes([16, 4])
-                    params.set_kv_tile_sizes([32, 32])
-                    params.set_kv_group_num(num_qo_heads // num_kv_heads)
+                        params = FastTreeParams()
+                        params.set_values(0.66, 0.33, 0.1)
+                        params.set_q_tile_sizes([16, 4])
+                        params.set_kv_tile_sizes([32, 32])
+                        params.set_kv_group_num(num_qo_heads // num_kv_heads)
 
-                    ft_aux, _ = fasttree_preparation(
-                        tree_info_ft,
-                        data_ft["kv_ptrs"],
-                        data_ft["batch_size"],
-                        num_qo_heads,
-                        num_kv_heads,
-                        head_dim,
-                        [1024, 128],
-                        [132, 528],
-                        [132, 132],
-                        params,
-                    )
-                    ft_out = torch.empty(batch_size, num_qo_heads, head_dim, device="cuda", dtype=dtype)
-
-                    def run_fasttree():
-                        fasttree_decode(
-                            q_ft, data_ft["k_tree"], data_ft["v_tree"], ft_out,
-                            *ft_aux, [16, 4], [32, 32], sm_scale,
+                        ft_aux, _ = fasttree_preparation(
+                            tree_info_ft,
+                            data_ft["kv_ptrs"],
+                            data_ft["batch_size"],
+                            num_qo_heads,
+                            num_kv_heads,
+                            head_dim,
+                            [1024, 128],
+                            [132, 528],
+                            [132, 132],
+                            params,
                         )
-                    run_fasttree()  # warmup / get output
-                    row["fasttree_ms"] = bench_ms(run_fasttree)
-                    row["fasttree_diff"] = ""  # different data layout, skip exact comparison
-                    print(f"  fasttree:   {row['fasttree_ms']:.4f} ms")
-                except Exception as e:
+                        ft_out = torch.empty(batch_size, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+
+                        def run_fasttree():
+                            fasttree_decode(
+                                q_ft, data_ft["k_tree"], data_ft["v_tree"], ft_out,
+                                *ft_aux, [16, 4], [32, 32], sm_scale,
+                            )
+                        run_fasttree()  # warmup / get output
+                        row["fasttree_ms"] = bench_ms(run_fasttree)
+                        row["fasttree_diff"] = ""  # different data layout, skip exact comparison
+                        print(f"  fasttree:   {row['fasttree_ms']:.4f} ms")
+                    except Exception as e:
+                        row["fasttree_ms"] = ""
+                        row["fasttree_diff"] = f"error:{type(e).__name__}"
+                        print(f"  fasttree:   ERROR {e}")
+                else:
                     row["fasttree_ms"] = ""
-                    row["fasttree_diff"] = f"error:{type(e).__name__}"
-                    print(f"  fasttree:   ERROR {e}")
-            else:
-                row["fasttree_ms"] = ""
-                row["fasttree_diff"] = ""
+                    row["fasttree_diff"] = ""
 
-            # ---- DeFT ----
-            if "deft" not in skip:
-                try:
-                    tree_info_deft = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
-                    data_deft = prepare_data(tree_info_deft, num_qo_heads, num_kv_heads, head_dim, dtype)
-                    q_deft = data_deft["q"].copy_(q)
+                # ---- DeFT ----
+                if "deft" not in skip:
+                    try:
+                        tree_info_deft = build_tree_info(num_prefixes, prefix_len, topk, suffix_len)
+                        data_deft = prepare_data(tree_info_deft, num_qo_heads, num_kv_heads, head_dim, dtype)
+                        q_deft = data_deft["q"].copy_(q)
 
-                    deft_module.cur_length = 0
-                    deft_aux = deft_module.DeFT_preparation(
-                        tree_info_deft,
-                        data_deft["k_cache_flat"],
-                        128,  # subtree_len
-                        64,   # mask_len
-                        num_qo_heads,
-                        head_dim,
-                    )
-                    deft_out = torch.empty(batch_size, num_qo_heads, head_dim, device="cuda", dtype=dtype)
-                    k_buf = data_deft["k_cache_flat"].view(-1, num_kv_heads, head_dim)
-                    v_buf = data_deft["v_cache_flat"].view(-1, num_kv_heads, head_dim)
-
-                    def run_deft():
-                        deft_module.DeFT_decode(
-                            q_deft, k_buf, v_buf, deft_out,
-                            *deft_aux, 16, 32, sm_scale, 64,
+                        deft_module.cur_length = 0
+                        deft_aux = deft_module.DeFT_preparation(
+                            tree_info_deft,
+                            data_deft["k_cache_flat"],
+                            128,  # subtree_len
+                            64,   # mask_len
+                            num_qo_heads,
+                            head_dim,
                         )
-                    run_deft()  # warmup / get output
-                    row["deft_ms"] = bench_ms(run_deft)
-                    row["deft_diff"] = ""
-                    print(f"  deft:       {row['deft_ms']:.4f} ms")
-                except Exception as e:
-                    row["deft_ms"] = ""
-                    row["deft_diff"] = f"error:{type(e).__name__}"
-                    print(f"  deft:       ERROR {e}")
-            else:
-                row["deft_ms"] = ""
-                row["deft_diff"] = ""
+                        deft_out = torch.empty(batch_size, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+                        k_buf = data_deft["k_cache_flat"].view(-1, num_kv_heads, head_dim)
+                        v_buf = data_deft["v_cache_flat"].view(-1, num_kv_heads, head_dim)
 
-            results.append(row)
+                        def run_deft():
+                            deft_module.DeFT_decode(
+                                q_deft, k_buf, v_buf, deft_out,
+                                *deft_aux, 16, 32, sm_scale, 64,
+                            )
+                        run_deft()  # warmup / get output
+                        row["deft_ms"] = bench_ms(run_deft)
+                        row["deft_diff"] = ""
+                        print(f"  deft:       {row['deft_ms']:.4f} ms")
+                    except Exception as e:
+                        row["deft_ms"] = ""
+                        row["deft_diff"] = f"error:{type(e).__name__}"
+                        print(f"  deft:       ERROR {e}")
+                else:
+                    row["deft_ms"] = ""
+                    row["deft_diff"] = ""
+
+                results.append(row)
 
     return results
 
@@ -546,32 +549,52 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 def print_table(results):
-    print(f"\n{'='*120}")
+    print(f"\n{'='*130}")
     print(f"Tree Attention Kernel Benchmark: FlashInfer (flat/cascade/ml_cascade) vs FastTree vs DeFT")
-    print(f"{'='*120}")
+    print(f"{'='*130}")
     header = (
-        f"  {'pfx':>3}  {'pfx_len':>7}  {'topk':>4}  {'sfx':>3}  {'batch':>5}  "
+        f"  {'#prefixes':>9}  {'prefix_len':>10}  {'topk':>4}  {'suffix_len':>10}  "
         f"{'flat(ms)':>9}  {'cascade':>9}  {'ml_casc':>9}  {'fasttree':>9}  {'deft':>9}  "
-        f"{'casc_diff':>9}  {'ml_diff':>9}"
+        f"{'casc_diff':>9}  {'ml_diff':>9}  {'fastest':>10}  {'speedup':>7}"
     )
     print(header)
-    print(f"  {'-'*3}  {'-'*7}  {'-'*4}  {'-'*3}  {'-'*5}  "
+    print(f"  {'-'*9}  {'-'*10}  {'-'*4}  {'-'*10}  "
           f"{'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  "
-          f"{'-'*9}  {'-'*9}")
+          f"{'-'*9}  {'-'*9}  {'-'*10}  {'-'*7}")
     for r in results:
         def fmt(v):
             if isinstance(v, (int, float)) and v != "":
                 return f"{v:.4f}"
             return str(v) if v != "" else "---"
+
+        # Find fastest kernel and speedup over flat
+        method_times = {}
+        for name, key in [("flat", "flat_ms"), ("cascade", "cascade_ms"),
+                          ("ml_casc", "ml_cascade_ms"), ("fasttree", "fasttree_ms"),
+                          ("deft", "deft_ms")]:
+            v = r.get(key, "")
+            if isinstance(v, (int, float)) and v != "":
+                method_times[name] = v
+        if method_times:
+            fastest_name = min(method_times, key=method_times.get)
+            flat_ms = r.get("flat_ms", "")
+            if isinstance(flat_ms, (int, float)) and flat_ms != "" and flat_ms > 0:
+                speedup = f"{flat_ms / method_times[fastest_name]:.2f}x"
+            else:
+                speedup = "---"
+        else:
+            fastest_name = "---"
+            speedup = "---"
+
         print(
-            f"  {r['num_prefixes']:>3}  {r['prefix_len']:>7}  {r['topk']:>4}  {r['suffix_len']:>3}  "
-            f"{r['batch_size']:>5}  "
+            f"  {r['num_prefixes']:>9}  {r['prefix_len']:>10}  {r['topk']:>4}  {r['suffix_len']:>10}  "
             f"{fmt(r.get('flat_ms', '')):>9}  {fmt(r.get('cascade_ms', '')):>9}  "
             f"{fmt(r.get('ml_cascade_ms', '')):>9}  {fmt(r.get('fasttree_ms', '')):>9}  "
             f"{fmt(r.get('deft_ms', '')):>9}  "
-            f"{fmt(r.get('cascade_diff', '')):>9}  {fmt(r.get('ml_cascade_diff', '')):>9}"
+            f"{fmt(r.get('cascade_diff', '')):>9}  {fmt(r.get('ml_cascade_diff', '')):>9}  "
+            f"{fastest_name:>10}  {speedup:>7}"
         )
-    print(f"{'='*120}")
+    print(f"{'='*130}")
 
 
 def write_csv(results, path):
@@ -580,7 +603,28 @@ def write_csv(results, path):
         "num_prefixes", "prefix_len", "topk", "suffix_len", "batch_size",
         "flat_ms", "cascade_ms", "ml_cascade_ms", "fasttree_ms", "deft_ms",
         "cascade_diff", "ml_cascade_diff", "fasttree_diff", "deft_diff",
+        "fastest", "speedup_over_flat",
     ]
+    # Compute fastest / speedup for CSV rows
+    for r in results:
+        method_times = {}
+        for name, key in [("flat", "flat_ms"), ("cascade", "cascade_ms"),
+                          ("ml_casc", "ml_cascade_ms"), ("fasttree", "fasttree_ms"),
+                          ("deft", "deft_ms")]:
+            v = r.get(key, "")
+            if isinstance(v, (int, float)) and v != "":
+                method_times[name] = v
+        if method_times:
+            fastest_name = min(method_times, key=method_times.get)
+            flat_ms = r.get("flat_ms", "")
+            if isinstance(flat_ms, (int, float)) and flat_ms != "" and flat_ms > 0:
+                r["speedup_over_flat"] = round(flat_ms / method_times[fastest_name], 2)
+            else:
+                r["speedup_over_flat"] = ""
+            r["fastest"] = fastest_name
+        else:
+            r["fastest"] = ""
+            r["speedup_over_flat"] = ""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -596,7 +640,7 @@ def main():
     parser = argparse.ArgumentParser(description="5-way tree attention kernel benchmark")
     parser.add_argument("--num-prefixes", default="1,4,8", help="Comma-separated num_prefixes values")
     parser.add_argument("--prefix-lens", default="1024,8192,16384", help="Comma-separated prefix lengths")
-    parser.add_argument("--topk", type=int, default=16)
+    parser.add_argument("--topk", default="4,8,16", help="Comma-separated topk values")
     parser.add_argument("--suffix-len", type=int, default=5)
     parser.add_argument("--num-qo-heads", type=int, default=32)
     parser.add_argument("--num-kv-heads", type=int, default=8)
@@ -611,7 +655,7 @@ def main():
     results = run_benchmark(
         num_prefixes_list=[int(x) for x in args.num_prefixes.split(",")],
         prefix_lens=[int(x) for x in args.prefix_lens.split(",")],
-        topk=args.topk,
+        topk_list=[int(x) for x in args.topk.split(",")],
         suffix_len=args.suffix_len,
         num_qo_heads=args.num_qo_heads,
         num_kv_heads=args.num_kv_heads,
