@@ -373,7 +373,9 @@ def run_benchmark(
                         q_data_type=dtype,
                     )
                     flat_out = flat_wrapper.run(q, kv_data)
-                    row["flat_ms"] = bench_ms(lambda: flat_wrapper.run(q, kv_data))
+                    # Pre-allocate output to avoid allocation overhead in timing loop
+                    flat_out_buf = torch.empty_like(q)
+                    row["flat_ms"] = bench_ms(lambda: flat_wrapper.run(q, kv_data, out=flat_out_buf))
                     print(f"  flat:       {row['flat_ms']:.4f} ms")
                 else:
                     row["flat_ms"] = ""
@@ -404,8 +406,11 @@ def run_benchmark(
                         inv_order[ri] = i
                     casc_out = casc_out_reordered[inv_order]
 
+                    # Pre-allocate output to avoid allocation overhead in timing loop
+                    casc_out_buf = torch.empty_like(q_casc)
+                    casc_lse_buf = torch.empty(q_casc.shape[0], q_casc.shape[1], device="cuda", dtype=torch.float32)
                     def run_cascade():
-                        cascade.run(q_casc, kv_data)
+                        cascade.run(q_casc, kv_data, out=casc_out_buf, lse=casc_lse_buf)
                     row["cascade_ms"] = bench_ms(run_cascade)
                     if flat_out is not None:
                         row["cascade_diff"] = (flat_out - casc_out).abs().max().item()
@@ -549,25 +554,25 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 def print_table(results):
-    print(f"\n{'='*130}")
+    print(f"\n{'='*145}")
     print(f"Tree Attention Kernel Benchmark: FlashInfer (flat/cascade/ml_cascade) vs FastTree vs DeFT")
-    print(f"{'='*130}")
+    print(f"{'='*145}")
     header = (
         f"  {'#prefixes':>9}  {'prefix_len':>10}  {'topk':>4}  {'suffix_len':>10}  "
         f"{'flat(ms)':>9}  {'cascade':>9}  {'ml_casc':>9}  {'fasttree':>9}  {'deft':>9}  "
-        f"{'casc_diff':>9}  {'ml_diff':>9}  {'fastest':>10}  {'speedup':>7}"
+        f"{'casc_diff':>9}  {'ml_diff':>9}  {'fastest':>10}  {'speedup':>7}  {'cascade_vs':>12}"
     )
     print(header)
     print(f"  {'-'*9}  {'-'*10}  {'-'*4}  {'-'*10}  "
           f"{'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  "
-          f"{'-'*9}  {'-'*9}  {'-'*10}  {'-'*7}")
+          f"{'-'*9}  {'-'*9}  {'-'*10}  {'-'*7}  {'-'*12}")
     for r in results:
         def fmt(v):
             if isinstance(v, (int, float)) and v != "":
                 return f"{v:.4f}"
             return str(v) if v != "" else "---"
 
-        # Find fastest kernel and speedup over flat
+        # Collect all valid method times
         method_times = {}
         for name, key in [("flat", "flat_ms"), ("cascade", "cascade_ms"),
                           ("ml_casc", "ml_cascade_ms"), ("fasttree", "fasttree_ms"),
@@ -575,16 +580,30 @@ def print_table(results):
             v = r.get(key, "")
             if isinstance(v, (int, float)) and v != "":
                 method_times[name] = v
+
+        fastest_name = "---"
+        speedup = "---"
+        cascade_vs = "---"
         if method_times:
-            fastest_name = min(method_times, key=method_times.get)
+            sorted_methods = sorted(method_times.items(), key=lambda x: x[1])
+            fastest_name = sorted_methods[0][0]
             flat_ms = r.get("flat_ms", "")
             if isinstance(flat_ms, (int, float)) and flat_ms != "" and flat_ms > 0:
-                speedup = f"{flat_ms / method_times[fastest_name]:.2f}x"
-            else:
-                speedup = "---"
-        else:
-            fastest_name = "---"
-            speedup = "---"
+                speedup = f"{flat_ms / sorted_methods[0][1]:.2f}x"
+
+            cascade_ms = method_times.get("cascade")
+            if cascade_ms is not None:
+                if fastest_name == "cascade":
+                    # Cascade is fastest: show % faster than 2nd fastest
+                    if len(sorted_methods) >= 2:
+                        second_ms = sorted_methods[1][1]
+                        pct = (second_ms - cascade_ms) / second_ms * 100
+                        cascade_vs = f"+{pct:.0f}%"
+                else:
+                    # Cascade is not fastest: show % slower than fastest
+                    best_ms = sorted_methods[0][1]
+                    pct = (cascade_ms - best_ms) / best_ms * 100
+                    cascade_vs = f"-{pct:.0f}%"
 
         print(
             f"  {r['num_prefixes']:>9}  {r['prefix_len']:>10}  {r['topk']:>4}  {r['suffix_len']:>10}  "
@@ -592,9 +611,9 @@ def print_table(results):
             f"{fmt(r.get('ml_cascade_ms', '')):>9}  {fmt(r.get('fasttree_ms', '')):>9}  "
             f"{fmt(r.get('deft_ms', '')):>9}  "
             f"{fmt(r.get('cascade_diff', '')):>9}  {fmt(r.get('ml_cascade_diff', '')):>9}  "
-            f"{fastest_name:>10}  {speedup:>7}"
+            f"{fastest_name:>10}  {speedup:>7}  {cascade_vs:>12}"
         )
-    print(f"{'='*130}")
+    print(f"{'='*145}")
 
 
 def write_csv(results, path):
@@ -603,7 +622,7 @@ def write_csv(results, path):
         "num_prefixes", "prefix_len", "topk", "suffix_len", "batch_size",
         "flat_ms", "cascade_ms", "ml_cascade_ms", "fasttree_ms", "deft_ms",
         "cascade_diff", "ml_cascade_diff", "fasttree_diff", "deft_diff",
-        "fastest", "speedup_over_flat",
+        "fastest", "speedup_over_flat", "cascade_vs",
     ]
     # Compute fastest / speedup for CSV rows
     for r in results:
@@ -615,16 +634,31 @@ def write_csv(results, path):
             if isinstance(v, (int, float)) and v != "":
                 method_times[name] = v
         if method_times:
-            fastest_name = min(method_times, key=method_times.get)
+            sorted_methods = sorted(method_times.items(), key=lambda x: x[1])
+            fastest_name = sorted_methods[0][0]
             flat_ms = r.get("flat_ms", "")
             if isinstance(flat_ms, (int, float)) and flat_ms != "" and flat_ms > 0:
-                r["speedup_over_flat"] = round(flat_ms / method_times[fastest_name], 2)
+                r["speedup_over_flat"] = round(flat_ms / sorted_methods[0][1], 2)
             else:
                 r["speedup_over_flat"] = ""
             r["fastest"] = fastest_name
+            cascade_ms = method_times.get("cascade")
+            if cascade_ms is not None:
+                if fastest_name == "cascade":
+                    if len(sorted_methods) >= 2:
+                        second_ms = sorted_methods[1][1]
+                        r["cascade_vs"] = round((second_ms - cascade_ms) / second_ms * 100, 1)
+                    else:
+                        r["cascade_vs"] = ""
+                else:
+                    best_ms = sorted_methods[0][1]
+                    r["cascade_vs"] = round(-(cascade_ms - best_ms) / best_ms * 100, 1)
+            else:
+                r["cascade_vs"] = ""
         else:
             r["fastest"] = ""
             r["speedup_over_flat"] = ""
+            r["cascade_vs"] = ""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -640,7 +674,7 @@ def main():
     parser = argparse.ArgumentParser(description="5-way tree attention kernel benchmark")
     parser.add_argument("--num-prefixes", default="1,4,8", help="Comma-separated num_prefixes values")
     parser.add_argument("--prefix-lens", default="1024,8192,16384", help="Comma-separated prefix lengths")
-    parser.add_argument("--topk", default="4,8,16", help="Comma-separated topk values")
+    parser.add_argument("--topk", default="8,16", help="Comma-separated topk values")
     parser.add_argument("--suffix-len", type=int, default=5)
     parser.add_argument("--num-qo-heads", type=int, default=32)
     parser.add_argument("--num-kv-heads", type=int, default=8)
