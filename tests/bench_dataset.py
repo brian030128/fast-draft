@@ -48,6 +48,7 @@ def create_engine(
     speculative_algorithm="STANDALONE",
     eagle_topk=None,
     speculative_num_steps=None,
+    speculative_num_draft_tokens=None,
     tp=1,
     context_length=None,
     mem_fraction_static=None,
@@ -72,7 +73,7 @@ def create_engine(
         if eagle_topk is not None or speculative_num_steps is not None:
             kwargs["speculative_eagle_topk"] = eagle_topk or 4
             kwargs["speculative_num_steps"] = speculative_num_steps or 10
-            kwargs["speculative_num_draft_tokens"] = (speculative_num_steps or 10) + 3
+            kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens or (speculative_num_steps or 10) + 3
 
     return Engine(**kwargs)
 
@@ -89,24 +90,32 @@ def dataset_short_name(path):
 
 def csv_filename(phase, args):
     """Generate CSV filename for a given phase."""
+    prefix = getattr(args, "result_prefix", "") or ""
     target = model_short_name(args.model_path)
     ds = dataset_short_name(args.dataset_path)
     if phase == "original":
-        return f"{target}_{ds}.csv"
+        return f"{prefix}{target}_{ds}.csv"
     else:
-        method = "cascade" if phase == "cascade" else "paged"
+        method = "cascade" if phase == "cascade" else "cascade_no_cg" if phase == "cascade_no_cg" else "fasttree" if phase == "fasttree" else "paged"
         draft = model_short_name(args.draft_model_path)
         topk = args.eagle_topk or 4
         depth = args.speculative_num_steps or 10
-        return f"standalone_{method}_{target}_{draft}_top{topk}_{depth}_{ds}.csv"
+        return f"{prefix}standalone_{method}_{target}_{draft}_top{topk}_{depth}_{ds}.csv"
 
 
 def run_phase(args, phase, records):
     """Run one benchmark phase on the given records. Returns list of per-prompt result dicts."""
+    # Reset all draft env vars
+    os.environ["SGLANG_CASCADE_DRAFT"] = "0"
+    os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "0"
+    os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
+
     if phase == "cascade":
         os.environ["SGLANG_CASCADE_DRAFT"] = "1"
-    else:
-        os.environ["SGLANG_CASCADE_DRAFT"] = "0"
+    elif phase == "cascade_no_cg":
+        os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "1"
+    elif phase == "fasttree":
+        os.environ["SGLANG_FASTTREE_DRAFT"] = "1"
 
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
@@ -131,9 +140,15 @@ def run_phase(args, phase, records):
     num_steps = args.speculative_num_steps if phase != "original" else None
 
     print(f"\n{'='*70}")
-    print(f"  Phase: {phase.upper()}"
-          + (f"  (SGLANG_CASCADE_DRAFT={os.environ.get('SGLANG_CASCADE_DRAFT', '0')})"
-             if phase != "original" else "  (no speculation)"))
+    if phase == "original":
+        phase_info = "  (no speculation)"
+    elif phase == "cascade_no_cg":
+        phase_info = "  (SGLANG_CASCADE_DRAFT_NO_CG=1, no CUDA graph for attn)"
+    elif phase == "fasttree":
+        phase_info = f"  (SGLANG_FASTTREE_DRAFT={os.environ.get('SGLANG_FASTTREE_DRAFT', '0')})"
+    else:
+        phase_info = f"  (SGLANG_CASCADE_DRAFT={os.environ.get('SGLANG_CASCADE_DRAFT', '0')})"
+    print(f"  Phase: {phase.upper()}{phase_info}")
     print(f"{'='*70}")
 
     engine = create_engine(
@@ -142,6 +157,7 @@ def run_phase(args, phase, records):
         speculative_algorithm=args.speculative_algorithm,
         eagle_topk=topk,
         speculative_num_steps=num_steps,
+        speculative_num_draft_tokens=getattr(args, "speculative_num_draft_tokens", None),
         tp=args.tp,
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
@@ -152,7 +168,7 @@ def run_phase(args, phase, records):
     _tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     max_prompt_tokens = None
     if args.context_length is not None:
-        max_prompt_tokens = args.context_length - args.max_new_tokens
+        max_prompt_tokens = args.context_length - args.max_new_tokens - 1
 
     all_input_ids = []
     truncated = 0
@@ -296,7 +312,7 @@ def print_summary(all_phase_results, args):
           f"{'-'*10}  {'-'*9}  {'-'*10}  "
           f"{'-'*8}  {'-'*7}  {'-'*8}  {'-'*9}")
 
-    for phase in ["original", "flat", "cascade"]:
+    for phase in ["original", "flat", "cascade_no_cg", "cascade"]:
         if phase not in phase_avgs:
             continue
         a = phase_avgs[phase]
@@ -306,7 +322,7 @@ def print_summary(all_phase_results, args):
         if orig_tps and phase != "original":
             vs_orig = f"{a['avg_throughput'] / orig_tps:.2f}x"
         vs_flat = ""
-        if flat_tps and phase == "cascade":
+        if flat_tps and phase in ("cascade", "cascade_no_cg"):
             vs_flat = f"{a['avg_throughput'] / flat_tps:.2f}x"
 
         draft_str = f"{a['avg_draft_time']:.3f}" if a['avg_draft_time'] > 0 else "-"
@@ -360,13 +376,15 @@ def add_common_args(parser):
     parser.add_argument("--speculative-algorithm", default="STANDALONE")
     parser.add_argument("--eagle-topk", type=int, default=None)
     parser.add_argument("--speculative-num-steps", type=int, default=None)
+    parser.add_argument("--speculative-num-draft-tokens", type=int, default=None,
+                        help="Verify budget (default: speculative_num_steps + 3)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--mem-fraction-static", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=1,
                         help="(reserved for future batched inference)")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--only", choices=["original", "flat", "cascade"],
+    parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
     parser.add_argument("--time-spec", action="store_true",
@@ -375,6 +393,8 @@ def add_common_args(parser):
                         help="Directory for CSV output (default: results/)")
     parser.add_argument("--num-samples", type=int, default=None,
                         help="Limit number of prompts from the dataset")
+    parser.add_argument("--result-prefix", default="",
+                        help="Prefix for CSV filenames (e.g. 'wo_graph_')")
 
 
 def main():
@@ -406,11 +426,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade"]
+    phases = ["original", "flat", "cascade_no_cg", "cascade"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade"]
+        phases = ["flat", "cascade_no_cg", "cascade"]
 
     forwarded_argv = sys.argv[1:]
 

@@ -14,6 +14,7 @@ Usage:
     python tests/bench_cascade_draft.py
     python tests/bench_cascade_draft.py --num-seqs 8 --topk 6
     python tests/bench_cascade_draft.py --prefix-lens 256,1024,4096,16384
+    python tests/bench_cascade_draft.py --qo-len 8                          # 8 query tokens per branch
     python tests/bench_cascade_draft.py --num-qo-heads 32 --num-kv-heads 8  # full model (no TP)
 """
 
@@ -31,6 +32,7 @@ sys.path.insert(
 
 import flashinfer
 from flashinfer.attention import CascadeBatchAttentionWrapper as CascadeBatchAttention
+from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
 
 
 def ceil_div(a, b):
@@ -49,6 +51,7 @@ def bench_eagle_draft_decode(
     dtype=torch.float16,
     warmup=50,
     repeat=200,
+    qo_len=1,
 ):
     results = []
 
@@ -72,7 +75,7 @@ def bench_eagle_draft_decode(
                 )
                 kv_data = (k_data, v_data)
                 q = torch.randn(
-                    total_branches, num_qo_heads, head_dim,
+                    total_branches * qo_len, num_qo_heads, head_dim,
                     device="cuda", dtype=dtype,
                 )
 
@@ -110,15 +113,32 @@ def bench_eagle_draft_decode(
                     device="cuda", dtype=torch.int32,
                 )
 
-                flat_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-                    "NHD",
-                )
-                flat_wrapper.plan(
-                    flat_kv_indptr, flat_kv_indices, flat_last_page_len,
-                    num_qo_heads, num_kv_heads, head_dim, page_size,
-                    q_data_type=dtype,
-                )
+                if qo_len == 1:
+                    flat_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                        "NHD",
+                    )
+                    flat_wrapper.plan(
+                        flat_kv_indptr, flat_kv_indices, flat_last_page_len,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        q_data_type=dtype,
+                    )
+                else:
+                    flat_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                        "NHD",
+                    )
+                    flat_qo_indptr = torch.arange(
+                        0, (total_branches + 1) * qo_len, qo_len,
+                        device="cuda", dtype=torch.int32,
+                    )
+                    flat_wrapper.plan(
+                        flat_qo_indptr, flat_kv_indptr, flat_kv_indices,
+                        flat_last_page_len,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        causal=False,
+                        q_data_type=dtype,
+                    )
 
                 for _ in range(warmup):
                     flat_wrapper.run(q, kv_data)
@@ -151,7 +171,7 @@ def bench_eagle_draft_decode(
                     (num_seqs,), prefix_len, device="cuda", dtype=torch.int32
                 )
                 qo_indptr_shared = torch.arange(
-                    0, (num_seqs + 1) * topk, topk,
+                    0, (num_seqs + 1) * topk * qo_len, topk * qo_len,
                     device="cuda", dtype=torch.int32,
                 )
 
@@ -176,7 +196,8 @@ def bench_eagle_draft_decode(
                     (total_branches,), suffix_len, device="cuda", dtype=torch.int32
                 )
                 qo_indptr_unique = torch.arange(
-                    0, total_branches + 1, device="cuda", dtype=torch.int32
+                    0, (total_branches + 1) * qo_len, qo_len,
+                    device="cuda", dtype=torch.int32,
                 )
 
                 cascade = CascadeBatchAttention(
@@ -211,12 +232,58 @@ def bench_eagle_draft_decode(
                 cascade_times = [s.elapsed_time(e) for s, e in zip(start_evts, end_evts)]
                 cascade_median = sorted(cascade_times)[len(cascade_times) // 2]
 
+                # --- MultiLevelCascade: flashinfer's built-in cascade ---
+                shared_last_page_len = torch.ones(
+                    num_seqs, device="cuda", dtype=torch.int32
+                )
+                unique_last_page_len = torch.ones(
+                    total_branches, device="cuda", dtype=torch.int32
+                )
+
+                ml_cascade = MultiLevelCascadeAttentionWrapper(
+                    num_levels=2,
+                    float_workspace_buffer=torch.zeros(
+                        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+                    ),
+                    kv_layout="NHD",
+                )
+                ml_cascade.plan(
+                    qo_indptr_arr=[qo_indptr_shared, qo_indptr_unique],
+                    paged_kv_indptr_arr=[shared_kv_indptr, unique_kv_indptr],
+                    paged_kv_indices_arr=[shared_kv_indices, unique_kv_indices],
+                    paged_kv_last_page_len=[shared_last_page_len, unique_last_page_len],
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    causal=False,
+                    q_data_type=dtype,
+                    kv_data_type=dtype,
+                )
+
+                for _ in range(warmup):
+                    ml_cascade.run(q, kv_data)
+                torch.cuda.synchronize()
+
+                start_evts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+                end_evts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+                for i in range(repeat):
+                    start_evts[i].record()
+                    ml_cascade.run(q, kv_data)
+                    end_evts[i].record()
+                torch.cuda.synchronize()
+                ml_cascade_times = [s.elapsed_time(e) for s, e in zip(start_evts, end_evts)]
+                ml_cascade_median = sorted(ml_cascade_times)[len(ml_cascade_times) // 2]
+
                 # Correctness check
                 flat_out = flat_wrapper.run(q, kv_data)
                 cascade_out, _ = cascade.run(q, kv_data)
+                ml_cascade_out = ml_cascade.run(q, kv_data)
                 max_diff = (flat_out - cascade_out).abs().max().item()
+                ml_max_diff = (flat_out - ml_cascade_out).abs().max().item()
 
                 speedup = flat_median / cascade_median if cascade_median > 0 else float("inf")
+                ml_speedup = flat_median / ml_cascade_median if ml_cascade_median > 0 else float("inf")
                 results.append({
                     "num_seqs": num_seqs,
                     "prefix_len": prefix_len,
@@ -226,20 +293,26 @@ def bench_eagle_draft_decode(
                     "cascade_ms": cascade_median,
                     "speedup": speedup,
                     "max_diff": max_diff,
+                    "ml_cascade_ms": ml_cascade_median,
+                    "ml_speedup": ml_speedup,
+                    "ml_max_diff": ml_max_diff,
                 })
 
     # Print results
     print(f"\n{'='*100}")
-    print(f"EAGLE Draft Decode Attention: Flat vs Cascade")
-    print(f"  topk={topk}, num_steps={num_steps}, heads={num_qo_heads}/{num_kv_heads}, "
+    print(f"EAGLE Draft Decode Attention: Flat vs Cascade vs MultiLevelCascade")
+    print(f"  topk={topk}, num_steps={num_steps}, qo_len={qo_len}, heads={num_qo_heads}/{num_kv_heads}, "
           f"head_dim={head_dim}, page_size={page_size}, dtype={dtype}")
     print(f"{'='*100}")
     print(f"  {'seqs':>4}  {'prefix':>7}  {'step':>4}  {'branches':>8}  "
-          f"{'flat(ms)':>9}  {'cascade(ms)':>11}  {'speedup':>8}  {'max_diff':>10}")
-    print(f"  {'-'*4}  {'-'*7}  {'-'*4}  {'-'*8}  {'-'*9}  {'-'*11}  {'-'*8}  {'-'*10}")
+          f"{'flat(ms)':>9}  {'cascade(ms)':>11}  {'speedup':>8}  {'max_diff':>10}  "
+          f"{'ml_cas(ms)':>10}  {'ml_spdup':>8}  {'ml_diff':>10}")
+    print(f"  {'-'*4}  {'-'*7}  {'-'*4}  {'-'*8}  {'-'*9}  {'-'*11}  {'-'*8}  {'-'*10}  "
+          f"{'-'*10}  {'-'*8}  {'-'*10}")
     for r in results:
         print(f"  {r['num_seqs']:>4}  {r['prefix_len']:>7}  {r['step']:>4}  {r['branches']:>8}  "
-              f"{r['flat_ms']:>9.4f}  {r['cascade_ms']:>11.4f}  {r['speedup']:>7.2f}x  {r['max_diff']:>10.6f}")
+              f"{r['flat_ms']:>9.4f}  {r['cascade_ms']:>11.4f}  {r['speedup']:>7.2f}x  {r['max_diff']:>10.6f}  "
+              f"{r['ml_cascade_ms']:>10.4f}  {r['ml_speedup']:>7.2f}x  {r['ml_max_diff']:>10.6f}")
     print(f"{'='*100}")
 
 
@@ -253,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-kv-heads", type=int, default=2, help="Number of KV heads (default: 2 for TP=4)")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument("--qo-len", type=int, default=1, help="Number of query tokens per branch (1=decode, >1=prefill)")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--repeat", type=int, default=200)
     args = parser.parse_args()
@@ -270,4 +344,5 @@ if __name__ == "__main__":
         dtype=dtype,
         warmup=args.warmup,
         repeat=args.repeat,
+        qo_len=args.qo_len,
     )

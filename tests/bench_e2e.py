@@ -50,6 +50,8 @@ def create_engine(
     tp: int = 1,
     context_length: int = None,
     mem_fraction_static: float = None,
+    kv_cache_dtype: str = "auto",
+    speculative_draft_model_quantization: str = None,
 ):
     """Create an sglang Engine with the given configuration."""
     from sglang.srt.entrypoints.engine import Engine
@@ -59,6 +61,7 @@ def create_engine(
         "tp_size": tp,
         "log_level": "warning",
         "enable_metrics": True,
+        "kv_cache_dtype": kv_cache_dtype,
     }
     if context_length is not None:
         kwargs["context_length"] = context_length
@@ -68,6 +71,8 @@ def create_engine(
     if draft_model_path is not None:
         kwargs["speculative_algorithm"] = speculative_algorithm
         kwargs["speculative_draft_model_path"] = draft_model_path
+        if speculative_draft_model_quantization is not None:
+            kwargs["speculative_draft_model_quantization"] = speculative_draft_model_quantization
         # sglang requires all three spec params to be None (auto) or all set
         if eagle_topk is not None or speculative_num_steps is not None:
             kwargs["speculative_eagle_topk"] = eagle_topk or 4
@@ -80,10 +85,17 @@ def create_engine(
 def run_phase(args, phase: str):
     """Run one benchmark phase. phase is 'original', 'flat', or 'cascade'."""
     # Set cascade env var before engine creation
+    # Reset all draft env vars
+    os.environ["SGLANG_CASCADE_DRAFT"] = "0"
+    os.environ["SGLANG_CASCADE_VERIFY"] = "0"
+    os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "0"
+
     if phase == "cascade":
         os.environ["SGLANG_CASCADE_DRAFT"] = "1"
-    else:
-        os.environ["SGLANG_CASCADE_DRAFT"] = "0"
+        os.environ["SGLANG_CASCADE_VERIFY"] = "1"
+    elif phase == "cascade_no_cg":
+        os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "1"
+        os.environ["SGLANG_CASCADE_VERIFY"] = "1"
 
     # Allow long context
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
@@ -110,9 +122,13 @@ def run_phase(args, phase: str):
     num_steps = args.speculative_num_steps if phase != "original" else None
 
     print(f"\n{'='*70}")
-    print(f"  Phase: {phase.upper()}"
-          + (f"  (SGLANG_CASCADE_DRAFT={os.environ.get('SGLANG_CASCADE_DRAFT', '0')})"
-             if phase != "original" else "  (no speculation)"))
+    if phase == "original":
+        phase_info = "  (no speculation)"
+    elif phase == "cascade_no_cg":
+        phase_info = "  (SGLANG_CASCADE_DRAFT_NO_CG=1, no CUDA graph for attn)"
+    else:
+        phase_info = f"  (SGLANG_CASCADE_DRAFT={os.environ.get('SGLANG_CASCADE_DRAFT', '0')})"
+    print(f"  Phase: {phase.upper()}{phase_info}")
     print(f"{'='*70}")
 
     engine = create_engine(
@@ -125,6 +141,8 @@ def run_phase(args, phase: str):
         tp=args.tp,
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
+        kv_cache_dtype=getattr(args, 'kv_cache_dtype', 'auto'),
+        speculative_draft_model_quantization=getattr(args, 'speculative_draft_model_quantization', None),
     )
 
     # Build prompt groups: list of (group_label, input_ids_list)
@@ -158,6 +176,7 @@ def run_phase(args, phase: str):
             "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
             "ignore_eos": True,
+            "sampling_seed": args.seed,
         }
 
         num_requests = len(input_ids_batch)
@@ -167,11 +186,11 @@ def run_phase(args, phase: str):
         warmup_ids = input_ids_batch[0][:256]
         engine.generate(
             input_ids=warmup_ids,
-            sampling_params={"temperature": args.temperature, "max_new_tokens": 4, "ignore_eos": True},
+            sampling_params={"temperature": args.temperature, "max_new_tokens": 4, "ignore_eos": True, "sampling_seed": args.seed},
         )
 
         # TTFT: measure per-phase (speculative engines have different prefill cost)
-        ttft_params = {"temperature": args.temperature, "max_new_tokens": 1, "ignore_eos": True}
+        ttft_params = {"temperature": args.temperature, "max_new_tokens": 1, "ignore_eos": True, "sampling_seed": args.seed}
         ttfts = []
         print(f"  Measuring TTFT ...")
         for i in range(num_requests):
@@ -247,6 +266,7 @@ def run_phase(args, phase: str):
                 "accept_length": accept_length,
                 "eagle_topk": (args.eagle_topk or 4) if phase != "original" else None,
                 "speculative_num_steps": (args.speculative_num_steps or 10) if phase != "original" else None,
+                "speculative_num_draft_tokens": (args.speculative_num_draft_tokens or (args.speculative_num_steps or 10) + 3) if phase != "original" else None,
             })
 
         # Get server-reported throughput
@@ -303,18 +323,20 @@ def print_results(all_results, prompt_lengths):
             "mean_output_tokens": total_comp / n,
             "eagle_topk": items[0].get("eagle_topk"),
             "speculative_num_steps": items[0].get("speculative_num_steps"),
+            "speculative_num_draft_tokens": items[0].get("speculative_num_draft_tokens"),
         }
 
     prompt_lens = sorted(set(int(x) for x in prompt_lengths))
     phases_present = []
-    for p in ["original", "flat", "cascade"]:
+    for p in ["original", "flat", "cascade_no_cg", "cascade"]:
         if any(r["phase"] == p for r in all_results):
             phases_present.append(p)
 
     # Extract shared params from first spec phase
-    spec_data = next((agg[k] for k in agg if k[0] in ("flat", "cascade")), None)
+    spec_data = next((agg[k] for k in agg if k[0] in ("flat", "cascade", "cascade_no_cg")), None)
     topk_val = spec_data["eagle_topk"] if spec_data else "-"
     depth_val = spec_data["speculative_num_steps"] if spec_data else "-"
+    draft_tokens_val = spec_data["speculative_num_draft_tokens"] if spec_data else "-"
     # mean output tokens (use first available phase)
     first_data = next(iter(agg.values()), None)
     out_tok_val = f"{first_data['mean_output_tokens']:.0f}" if first_data else "-"
@@ -323,15 +345,15 @@ def print_results(all_results, prompt_lengths):
     print(f"\n{'='*120}")
     print(f"  E2E Benchmark Results")
     print(f"{'='*120}")
-    print(f"  topk={topk_val}  depth={depth_val}  "
+    print(f"  topk={topk_val}  depth={depth_val}  draft_tokens={draft_tokens_val}  "
           f"out_tokens={out_tok_val}  n={n_val}  "
           f"prompt_lengths={','.join(str(p) for p in prompt_lens)}")
     print(f"{'-'*120}")
-    print(f"  {'prompt':>7}  {'phase':>9}  {'lat(s)':>8}  {'ttft(s)':>8}  {'dec(s)':>8}  "
+    print(f"  {'prompt':>7}  {'phase':>13}  {'lat(s)':>8}  {'ttft(s)':>8}  {'dec(s)':>8}  "
           f"{'draft(s)':>8}  {'verify(s)':>9}  "
           f"{'e2e tok/s':>10}  {'dec tok/s':>10}  {'accept':>7}  "
           f"{'dec vs orig':>11}  {'dec vs flat':>11}")
-    print(f"  {'-'*7}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*8}  "
+    print(f"  {'-'*7}  {'-'*13}  {'-'*8}  {'-'*8}  {'-'*8}  "
           f"{'-'*8}  {'-'*9}  "
           f"{'-'*10}  {'-'*10}  {'-'*7}  "
           f"{'-'*11}  {'-'*11}")
@@ -346,13 +368,13 @@ def print_results(all_results, prompt_lengths):
             vs_flat = ""
             if phase != "original" and orig and orig["mean_decode_tps"] > 0:
                 vs_orig = f"{data['mean_decode_tps'] / orig['mean_decode_tps']:.2f}x"
-            if phase == "cascade":
+            if phase in ("cascade", "cascade_no_cg"):
                 flat = agg.get(("flat", pl))
                 if flat and flat["mean_decode_tps"] > 0:
                     vs_flat = f"{data['mean_decode_tps'] / flat['mean_decode_tps']:.2f}x"
             draft_str = f"{data['mean_draft_time']:>8.2f}" if data['mean_draft_time'] > 0 else f"{'—':>8}"
             verify_str = f"{data['mean_verify_time']:>9.2f}" if data['mean_verify_time'] > 0 else f"{'—':>9}"
-            print(f"  {pl:>7}  {phase:>9}  "
+            print(f"  {pl:>7}  {phase:>13}  "
                   f"{data['mean_latency']:>8.2f}  {data['mean_ttft']:>8.2f}  {data['mean_decode_time']:>8.2f}  "
                   f"{draft_str}  {verify_str}  "
                   f"{data['mean_e2e_tps']:>10.1f}  "
@@ -406,13 +428,15 @@ def add_common_args(parser):
                         help="Number of draft tokens to keep (default: num_steps + 3)")
     parser.add_argument("--temperature", type=float, default=0.2,
                         help="Sampling temperature (default: 0.2)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for sampling (default: 42)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-requests", type=int, default=1)
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--mem-fraction-static", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--only", choices=["original", "flat", "cascade"],
+    parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true",
                         help="Skip the original (no speculation) phase")
@@ -420,6 +444,11 @@ def add_common_args(parser):
                         help="Write JSON results to file")
     parser.add_argument("--time-spec", action="store_true",
                         help="Enable draft/verify timing (adds torch.cuda.synchronize overhead)")
+    parser.add_argument("--kv-cache-dtype", default="auto",
+                        choices=["auto", "fp8_e4m3", "fp8_e5m2"],
+                        help="KV cache data type (default: auto)")
+    parser.add_argument("--speculative-draft-model-quantization", default=None,
+                        help="Quantization method for draft model (e.g. awq, fp8, gptq)")
 
 
 def run_phase_subprocess(phase: str, argv: list[str]) -> list[dict]:
@@ -463,11 +492,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade"]
+    phases = ["original", "flat", "cascade_no_cg", "cascade"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade"]
+        phases = ["flat", "cascade_no_cg", "cascade"]
 
     # Forward all original argv (minus script name) to subprocesses
     forwarded_argv = sys.argv[1:]

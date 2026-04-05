@@ -13,9 +13,9 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 DATASETS = {"gov_report", "narrativeqa", "pg19"}
 
 # Regex for speculative decoding filenames:
-#   standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}.csv
+#   [wo_graph_]standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}.csv
 SPEC_RE = re.compile(
-    r"^standalone_(cascade|paged)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+)\.csv$"
+    r"^(wo_graph_)?standalone_(cascade|paged)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+)\.csv$"
 )
 
 
@@ -23,21 +23,29 @@ def parse_filename(name: str) -> dict | None:
     """Return metadata dict or None if the file doesn't match any pattern."""
     m = SPEC_RE.match(name)
     if m:
+        wo_graph = m.group(1) is not None
+        method = m.group(2)
+        if wo_graph:
+            method = f"{method}_wo_graph"
         return {
-            "method": m.group(1),
-            "target_model": m.group(2),
-            "draft_model": m.group(3),
-            "topk": int(m.group(4)),
-            "steps": int(m.group(5)),
-            "dataset": m.group(6),
+            "method": method,
+            "target_model": m.group(3),
+            "draft_model": m.group(4),
+            "topk": int(m.group(5)),
+            "steps": int(m.group(6)),
+            "dataset": m.group(7),
         }
-    # AR pattern: {target_model}_{dataset}.csv
+    # AR pattern: [wo_graph_]{target_model}_{dataset}.csv
     stem = name.removesuffix(".csv")
     for ds in DATASETS:
         if stem.endswith(f"_{ds}"):
             target = stem.removesuffix(f"_{ds}")
+            wo_graph = target.startswith("wo_graph_")
+            if wo_graph:
+                target = target.removeprefix("wo_graph_")
+            method = "ar_wo_graph" if wo_graph else "ar"
             return {
-                "method": "ar",
+                "method": method,
                 "target_model": target,
                 "draft_model": None,
                 "topk": None,
@@ -54,7 +62,7 @@ def load_results(results_dir: Path) -> dict[tuple[str, str, int | None], dict[st
     (dataset, target_model) so that speedup-vs-AR comparisons work per topk.
     """
     grouped = defaultdict(dict)
-    ar_by_key: dict[tuple[str, str], pd.DataFrame] = {}
+    ar_by_key: dict[tuple[tuple[str, str], str], pd.DataFrame] = {}
     topks_by_key: dict[tuple[str, str], set[int]] = defaultdict(set)
     draft_models: dict[tuple[str, str, int], str] = {}
 
@@ -66,7 +74,7 @@ def load_results(results_dir: Path) -> dict[tuple[str, str, int | None], dict[st
         df["decode_time"] = df["e2e"] - df["ttft"]
         ds_target = (meta["dataset"], meta["target_model"])
         if meta["topk"] is None:
-            ar_by_key[ds_target] = df
+            ar_by_key[(ds_target, meta["method"])] = df
         else:
             key = (meta["dataset"], meta["target_model"], meta["topk"])
             grouped[key][meta["method"]] = df
@@ -74,15 +82,15 @@ def load_results(results_dir: Path) -> dict[tuple[str, str, int | None], dict[st
             if meta["draft_model"]:
                 draft_models[(meta["dataset"], meta["target_model"], meta["topk"])] = meta["draft_model"]
 
-    # Inject AR into each topk group
-    for (dataset, target), df in ar_by_key.items():
+    # Inject AR (and ar_wo_graph) into each topk group
+    for ((dataset, target), method), df in ar_by_key.items():
         topks = topks_by_key.get((dataset, target))
         if topks:
             for topk in topks:
-                grouped[(dataset, target, topk)]["ar"] = df
+                grouped[(dataset, target, topk)][method] = df
         else:
             # No spec results for this dataset+target, keep AR standalone
-            grouped[(dataset, target, None)]["ar"] = df
+            grouped[(dataset, target, None)][method] = df
 
     return dict(grouped), draft_models
 
@@ -108,9 +116,7 @@ def build_summary(grouped: dict[tuple[str, str, int | None], dict[str, pd.DataFr
     """Build a summary DataFrame with one row per (dataset, target_model, topk, method)."""
     rows = []
     for (dataset, target_model, topk) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0)):
-        for method in ["ar", "cascade", "paged"]:
-            if method not in grouped[(dataset, target_model, topk)]:
-                continue
+        for method in sorted(grouped[(dataset, target_model, topk)].keys()):
             stats = aggregate(grouped[(dataset, target_model, topk)][method])
             stats["dataset"] = dataset
             stats["target_model"] = target_model
@@ -132,22 +138,37 @@ def add_speedups(summary: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (dataset, target_model, topk), grp in summary.groupby(["dataset", "target_model", "topk"]):
         ar_row = grp[grp["method"] == "ar"]
+        ar_wo_graph_row = grp[grp["method"] == "ar_wo_graph"]
         cascade_row = grp[grp["method"] == "cascade"]
         paged_row = grp[grp["method"] == "paged"]
+        cascade_wo_graph_row = grp[grp["method"] == "cascade_wo_graph"]
+        paged_wo_graph_row = grp[grp["method"] == "paged_wo_graph"]
 
         for _, row in grp.iterrows():
             r = row.copy()
-            # Speedup vs AR (on e2e and decode_time)
-            if len(ar_row) > 0:
-                ar_e2e = ar_row["avg_e2e"].values[0]
-                ar_dec = ar_row["avg_decode_time"].values[0]
+            method = row["method"]
+            is_wo_graph = method.endswith("_wo_graph")
+
+            # Pick matching AR baseline (wo_graph methods compare against ar_wo_graph)
+            ref_ar = ar_wo_graph_row if is_wo_graph else ar_row
+            if len(ref_ar) > 0:
+                ar_e2e = ref_ar["avg_e2e"].values[0]
+                ar_dec = ref_ar["avg_decode_time"].values[0]
                 r["e2e_speedup_vs_ar"] = ar_e2e / r["avg_e2e"] if r["avg_e2e"] > 0 else float("nan")
                 r["decode_speedup_vs_ar"] = ar_dec / r["avg_decode_time"] if r["avg_decode_time"] > 0 else float("nan")
-            # Cascade vs paged (only for cascade row)
-            if row["method"] == "cascade" and len(paged_row) > 0:
-                paged_e2e = paged_row["avg_e2e"].values[0]
-                paged_dec = paged_row["avg_decode_time"].values[0]
-                paged_draft = paged_row["avg_draft_time"].values[0]
+
+            # Cascade vs paged (within same graph/no-graph group)
+            if method == "cascade" and len(paged_row) > 0:
+                ref_paged = paged_row
+            elif method == "cascade_wo_graph" and len(paged_wo_graph_row) > 0:
+                ref_paged = paged_wo_graph_row
+            else:
+                ref_paged = None
+
+            if ref_paged is not None:
+                paged_e2e = ref_paged["avg_e2e"].values[0]
+                paged_dec = ref_paged["avg_decode_time"].values[0]
+                paged_draft = ref_paged["avg_draft_time"].values[0]
                 r["e2e_speedup_vs_paged"] = paged_e2e / r["avg_e2e"] if r["avg_e2e"] > 0 else float("nan")
                 r["decode_speedup_vs_paged"] = paged_dec / r["avg_decode_time"] if r["avg_decode_time"] > 0 else float("nan")
                 r["draft_speedup_vs_paged"] = paged_draft / r["avg_draft_time"] if r["avg_draft_time"] > 0 else float("nan")
@@ -160,6 +181,13 @@ def print_dataset_table(dataset: str, target_model: str, draft_model: str,
     """Pretty-print summary for one dataset + target_model + topk combination."""
     topk_str = f"  topk={topk}" if topk is not None else ""
     draft_str = f"  draft={draft_model}" if draft_model and draft_model != "—" else ""
+    if df.empty:
+        print(f"\n{'='*80}")
+        print(f"  [SKIP] Empty dataframe for dataset={dataset} target={target_model}"
+              f" draft={draft_model} topk={topk}")
+        print(f"  Columns: {list(df.columns)}")
+        print(f"{'='*80}")
+        return
     print(f"\n{'='*80}")
     print(f"  Dataset: {dataset}  target={target_model}{draft_str}{topk_str}  (n={int(df['num_samples'].iloc[0])})")
     print(f"{'='*80}")
@@ -195,23 +223,25 @@ def print_dataset_table(dataset: str, target_model: str, draft_model: str,
         print(line)
 
     # Speedup summary
-    cascade_row = df[df["method"] == "cascade"]
-    paged_row = df[df["method"] == "paged"]
-    ar_row = df[df["method"] == "ar"]
-
     print()
-    if len(cascade_row) > 0 and len(ar_row) > 0:
-        r = cascade_row.iloc[0]
-        if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
-            print(f"  Cascade vs AR:     e2e {r['e2e_speedup_vs_ar']:.3f}x  decode {r['decode_speedup_vs_ar']:.3f}x")
-    if len(paged_row) > 0 and len(ar_row) > 0:
-        r = paged_row.iloc[0]
-        if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
-            print(f"  Paged vs AR:       e2e {r['e2e_speedup_vs_ar']:.3f}x  decode {r['decode_speedup_vs_ar']:.3f}x")
-    if len(cascade_row) > 0 and "e2e_speedup_vs_paged" in cascade_row.columns:
-        r = cascade_row.iloc[0]
-        if pd.notna(r.get("e2e_speedup_vs_paged")):
-            print(f"  Cascade vs Paged:  e2e {r['e2e_speedup_vs_paged']:.3f}x  decode {r['decode_speedup_vs_paged']:.3f}x  draft {r['draft_speedup_vs_paged']:.3f}x")
+    # Print speedups for each cascade variant vs its matching paged/AR
+    for suffix, label_prefix in [("", ""), ("_wo_graph", " (wo_graph)")]:
+        cascade_row = df[df["method"] == f"cascade{suffix}"]
+        paged_row = df[df["method"] == f"paged{suffix}"]
+        ar_row = df[df["method"] == f"ar{suffix}"]
+
+        if len(cascade_row) > 0 and len(ar_row) > 0:
+            r = cascade_row.iloc[0]
+            if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
+                print(f"  Cascade{label_prefix} vs AR:     e2e {r['e2e_speedup_vs_ar']:.3f}x  decode {r['decode_speedup_vs_ar']:.3f}x")
+        if len(paged_row) > 0 and len(ar_row) > 0:
+            r = paged_row.iloc[0]
+            if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
+                print(f"  Paged{label_prefix} vs AR:       e2e {r['e2e_speedup_vs_ar']:.3f}x  decode {r['decode_speedup_vs_ar']:.3f}x")
+        if len(cascade_row) > 0 and "e2e_speedup_vs_paged" in cascade_row.columns:
+            r = cascade_row.iloc[0]
+            if pd.notna(r.get("e2e_speedup_vs_paged")):
+                print(f"  Cascade{label_prefix} vs Paged:  e2e {r['e2e_speedup_vs_paged']:.3f}x  decode {r['decode_speedup_vs_paged']:.3f}x  draft {r['draft_speedup_vs_paged']:.3f}x")
 
 
 def main():
@@ -252,13 +282,14 @@ def main():
         ].mean()
         print(overall.to_string(float_format="%.3f"))
 
-    # AR overall per target_model
-    ar_subset = summary[summary["method"] == "ar"]
-    for target_model, subset in ar_subset.groupby("target_model"):
+    # AR overall per target_model (includes ar and ar_wo_graph)
+    ar_subset = summary[summary["method"].str.startswith("ar")]
+    for (target_model, method), subset in ar_subset.groupby(["target_model", "method"]):
         # Deduplicate AR rows (they're duplicated into each topk group)
         subset = subset.drop_duplicates(subset="dataset")
+        label = "AR" if method == "ar" else "AR (wo_graph)"
         print(f"\n{'='*80}")
-        print(f"  Overall AR  target={target_model} (averaged across datasets)")
+        print(f"  Overall {label}  target={target_model} (averaged across datasets)")
         print(f"{'='*80}")
         overall = subset[
             ["avg_e2e", "avg_ttft", "avg_decode_time",
