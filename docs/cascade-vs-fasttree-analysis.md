@@ -215,6 +215,18 @@ After the threshold fix, tile boundary fix, and kv_limit cap, the gap has narrow
 | Grid sizing | Exact (num_vnodes × num_kv_heads) | Fixed 264 CTAs (persistent) | Inflexible |
 | Kernel complexity | Single-purpose Triton | Fused 2-runner persistent CUDA | Higher overhead |
 
-### Remaining losses (8 of 27 configs)
+### Remaining losses (8 of 27 configs) — root cause: register pressure
 
-Cascade still loses at p=4/p=8 with prefix=1K (problem too small — kernel launch overhead dominates) and p=8/4K/topk=4-16 (moderate prefix with many prefixes — Q tile waste and per-item overhead accumulate).
+Measured register counts (cuobjdump):
+- **FastTree stage1**: 83 regs/thread → max **6 CTAs/SM** → 768 threads/SM
+- **Cascade attention**: 166 regs/thread → max **3 CTAs/SM** → 384 threads/SM
+
+FastTree has **2x the occupancy** → 2x more outstanding memory requests → 2x better HBM bandwidth:
+- FastTree: 3.65 TB/s (109% of peak — L2 cache helps)
+- Cascade: 1.00 TB/s (30% of peak)
+
+The 166 regs come from **fusing Runner1 + Runner2** into one kernel binary. nvcc allocates `max(Runner1_regs, Runner2_regs)`. Even though each CTA only executes one runner's code path at a time, the register file is sized for the worst case.
+
+Splitting into separate kernel launches (one for Task 0 / Runner1, one for Task 1 / Runner2) would give each kernel its own register budget, potentially achieving ~100 regs/thread → 5 CTAs/SM → better bandwidth.
+
+`__launch_bounds__(128, 4)` was tried to force lower regs, but the resulting register spilling to local memory hurt large-prefix configs more than the occupancy gain helped (p=8/16K/topk=16 regressed from 0.227ms to 0.302ms).
