@@ -365,6 +365,7 @@ def run_benchmark(
                         kv_indptr, kv_indices, kv_last_page_len, kv_lens = build_flashinfer_flat_indices(tree_info, data)
                         flat_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                             torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD",
+                            use_tensor_cores=True,
                         )
                         flat_wrapper.plan(
                             kv_indptr, kv_indices, kv_last_page_len,
@@ -646,9 +647,9 @@ def write_csv(results, path):
 def main():
     parser = argparse.ArgumentParser(description="5-way tree attention kernel benchmark")
     parser.add_argument("--num-prefixes", default="1,4,8", help="Comma-separated num_prefixes values")
-    parser.add_argument("--prefix-lens", default="2048,4096,8192,16384,32768", help="Comma-separated prefix lengths")
+    parser.add_argument("--prefix-lens", default="2048,8192,16384,32768", help="Comma-separated prefix lengths")
     parser.add_argument("--topk", default="8,16", help="Comma-separated topk values")
-    parser.add_argument("--suffix-len", type=int, default=5)
+    parser.add_argument("--suffix-len", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--csv", default=None, help="Path prefix to write CSV results (overrides auto naming)")
@@ -688,7 +689,10 @@ def main():
         print_table(results)
 
         if args.csv:
-            csv_path = args.csv.replace(".csv", f"_hq{num_qo_heads}_hkv{num_kv_heads}.csv")
+            base, ext = os.path.splitext(args.csv)
+            if not ext:
+                ext = ".csv"
+            csv_path = f"{base}_hq{num_qo_heads}_hkv{num_kv_heads}{ext}"
         else:
             csv_path = f"bench_tree_attn_hq{num_qo_heads}_hkv{num_kv_heads}.csv"
         write_csv(results, csv_path)
