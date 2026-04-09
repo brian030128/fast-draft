@@ -90,7 +90,7 @@ def main():
     qo_len = 1
     dtype = torch.bfloat16
 
-    header = f"  {'tag':>4}  {'kv_lens':>25}  {'batch_sizes':>15}  {'MultiLevel':>12}  {'Fused':>12}  {'Speedup':>8}"
+    header = f"  {'tag':>4}  {'kv_lens':>25}  {'batch_sizes':>15}  {'MultiLevel':>12}  {'Fused':>12}  {'Speedup':>8}  {'Correct':>20}"
     print(header)
     print("  " + "-" * len(header))
 
@@ -132,8 +132,19 @@ def main():
         )
         fused_ms = bench(lambda: cascade.run(q, kv_data))
 
+        # Correctness check
+        ref_out = ref.run(q, kv_data)
+        fused_out, _fused_lse = cascade.run(q, kv_data)
+        atol = 1e-2
+        rtol = 1e-2
+        if torch.allclose(ref_out, fused_out, atol=atol, rtol=rtol):
+            correct = "PASS"
+        else:
+            max_diff = (ref_out - fused_out).abs().max().item()
+            correct = f"FAIL (max_diff={max_diff:.6f})"
+
         speedup = ref_ms / fused_ms
-        print(f"  {tag:>4}  {str(kv_lens):>25}  {str(batch_sizes):>15}  {ref_ms:>10.4f}ms  {fused_ms:>10.4f}ms  {speedup:>7.2f}x")
+        print(f"  {tag:>4}  {str(kv_lens):>25}  {str(batch_sizes):>15}  {ref_ms:>10.4f}ms  {fused_ms:>10.4f}ms  {speedup:>7.2f}x  {correct}")
 
 
 if __name__ == "__main__":
