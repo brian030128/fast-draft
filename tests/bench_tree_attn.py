@@ -646,7 +646,7 @@ def write_csv(results, path):
 def main():
     parser = argparse.ArgumentParser(description="5-way tree attention kernel benchmark")
     parser.add_argument("--num-prefixes", default="1,4,8", help="Comma-separated num_prefixes values")
-    parser.add_argument("--prefix-lens", default="1024,2048,4096,8192,16384,32768", help="Comma-separated prefix lengths")
+    parser.add_argument("--prefix-lens", default="2048,4096,8192,16384,32768", help="Comma-separated prefix lengths")
     parser.add_argument("--topk", default="8,16", help="Comma-separated topk values")
     parser.add_argument("--suffix-len", type=int, default=5)
     parser.add_argument("--head-dim", type=int, default=128)
