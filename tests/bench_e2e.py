@@ -440,6 +440,9 @@ def add_common_args(parser):
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true",
                         help="Skip the original (no speculation) phase")
+    parser.add_argument("--skip", nargs="+",
+                        choices=["original", "flat", "cascade", "cascade_no_cg"],
+                        default=[], help="Skip specified phases")
     parser.add_argument("--result-file", default=None,
                         help="Write JSON results to file")
     parser.add_argument("--time-spec", action="store_true",
@@ -497,6 +500,8 @@ def main():
         phases = [args.only]
     elif args.skip_original:
         phases = ["flat", "cascade_no_cg", "cascade"]
+    if args.skip:
+        phases = [p for p in phases if p not in args.skip]
 
     # Forward all original argv (minus script name) to subprocesses
     forwarded_argv = sys.argv[1:]
