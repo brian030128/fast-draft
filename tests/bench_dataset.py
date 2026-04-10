@@ -436,7 +436,11 @@ def main():
     if args.only:
         phases = [args.only]
     elif args.skip_original:
+<<<<<<< Updated upstream
         phases = ["flat", "cascade_no_cg", "cascade", "fasttree"]
+=======
+        phases = ["flat", "cascade_no_cg", "cascade"]
+>>>>>>> Stashed changes
     if args.skip:
         phases = [p for p in phases if p not in args.skip]
 

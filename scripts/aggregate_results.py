@@ -55,16 +55,17 @@ def parse_filename(name: str) -> dict | None:
     return None
 
 
-def load_results(results_dir: Path) -> dict[tuple[str, str, int | None], dict[str, pd.DataFrame]]:
-    """Load CSVs grouped as {(dataset, target_model, topk): {method: DataFrame}}.
+def load_results(results_dir: Path) -> dict[tuple[str, str, int | None, int | None], dict[str, pd.DataFrame]]:
+    """Load CSVs grouped as {(dataset, target_model, topk, steps): {method: DataFrame}}.
 
-    AR results (topk=None) are duplicated into every topk group for the same
-    (dataset, target_model) so that speedup-vs-AR comparisons work per topk.
+    AR results (topk=None, steps=None) are duplicated into every (topk, steps)
+    group for the same (dataset, target_model) so that speedup-vs-AR comparisons
+    work per group.
     """
     grouped = defaultdict(dict)
     ar_by_key: dict[tuple[tuple[str, str], str], pd.DataFrame] = {}
-    topks_by_key: dict[tuple[str, str], set[int]] = defaultdict(set)
-    draft_models: dict[tuple[str, str, int], str] = {}
+    spec_keys_by_target: dict[tuple[str, str], set[tuple[int, int]]] = defaultdict(set)
+    draft_models: dict[tuple[str, str, int, int], str] = {}
 
     for f in sorted(results_dir.glob("*.csv")):
         meta = parse_filename(f.name)
@@ -76,21 +77,21 @@ def load_results(results_dir: Path) -> dict[tuple[str, str, int | None], dict[st
         if meta["topk"] is None:
             ar_by_key[(ds_target, meta["method"])] = df
         else:
-            key = (meta["dataset"], meta["target_model"], meta["topk"])
+            key = (meta["dataset"], meta["target_model"], meta["topk"], meta["steps"])
             grouped[key][meta["method"]] = df
-            topks_by_key[ds_target].add(meta["topk"])
+            spec_keys_by_target[ds_target].add((meta["topk"], meta["steps"]))
             if meta["draft_model"]:
-                draft_models[(meta["dataset"], meta["target_model"], meta["topk"])] = meta["draft_model"]
+                draft_models[key] = meta["draft_model"]
 
-    # Inject AR (and ar_wo_graph) into each topk group
+    # Inject AR (and ar_wo_graph) into each (topk, steps) group
     for ((dataset, target), method), df in ar_by_key.items():
-        topks = topks_by_key.get((dataset, target))
-        if topks:
-            for topk in topks:
-                grouped[(dataset, target, topk)][method] = df
+        keys = spec_keys_by_target.get((dataset, target))
+        if keys:
+            for topk, steps in keys:
+                grouped[(dataset, target, topk, steps)][method] = df
         else:
             # No spec results for this dataset+target, keep AR standalone
-            grouped[(dataset, target, None)][method] = df
+            grouped[(dataset, target, None, None)][method] = df
 
     return dict(grouped), draft_models
 
@@ -111,22 +112,23 @@ def aggregate(df: pd.DataFrame) -> pd.Series:
     return pd.Series(stats)
 
 
-def build_summary(grouped: dict[tuple[str, str, int | None], dict[str, pd.DataFrame]],
+def build_summary(grouped: dict[tuple[str, str, int | None, int | None], dict[str, pd.DataFrame]],
                    draft_models: dict) -> pd.DataFrame:
-    """Build a summary DataFrame with one row per (dataset, target_model, topk, method)."""
+    """Build a summary DataFrame with one row per (dataset, target_model, topk, steps, method)."""
     rows = []
-    for (dataset, target_model, topk) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0)):
-        for method in sorted(grouped[(dataset, target_model, topk)].keys()):
-            stats = aggregate(grouped[(dataset, target_model, topk)][method])
+    for (dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0, x[3] or 0)):
+        for method in sorted(grouped[(dataset, target_model, topk, steps)].keys()):
+            stats = aggregate(grouped[(dataset, target_model, topk, steps)][method])
             stats["dataset"] = dataset
             stats["target_model"] = target_model
-            stats["draft_model"] = draft_models.get((dataset, target_model, topk), "—")
+            stats["draft_model"] = draft_models.get((dataset, target_model, topk, steps), "—")
             stats["topk"] = topk
+            stats["steps"] = steps
             stats["method"] = method
             rows.append(stats)
     summary = pd.DataFrame(rows)
     # Reorder columns
-    cols = ["dataset", "target_model", "draft_model", "topk", "method", "num_samples", "avg_prompt_len",
+    cols = ["dataset", "target_model", "draft_model", "topk", "steps", "method", "num_samples", "avg_prompt_len",
             "avg_e2e", "avg_ttft", "avg_decode_time",
             "avg_draft_time", "avg_verify_time",
             "avg_throughput", "avg_accept_length"]
@@ -136,7 +138,7 @@ def build_summary(grouped: dict[tuple[str, str, int | None], dict[str, pd.DataFr
 def add_speedups(summary: pd.DataFrame) -> pd.DataFrame:
     """Add speedup columns relative to AR and cascade-vs-paged."""
     rows = []
-    for (dataset, target_model, topk), grp in summary.groupby(["dataset", "target_model", "topk"]):
+    for (dataset, target_model, topk, steps), grp in summary.groupby(["dataset", "target_model", "topk", "steps"]):
         ar_row = grp[grp["method"] == "ar"]
         ar_wo_graph_row = grp[grp["method"] == "ar_wo_graph"]
         cascade_row = grp[grp["method"] == "cascade"]
@@ -177,19 +179,20 @@ def add_speedups(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def print_dataset_table(dataset: str, target_model: str, draft_model: str,
-                        topk: int | None, df: pd.DataFrame):
-    """Pretty-print summary for one dataset + target_model + topk combination."""
+                        topk: int | None, steps: int | None, df: pd.DataFrame):
+    """Pretty-print summary for one dataset + target_model + topk + steps combination."""
     topk_str = f"  topk={topk}" if topk is not None else ""
+    steps_str = f"  steps={steps}" if steps is not None else ""
     draft_str = f"  draft={draft_model}" if draft_model and draft_model != "—" else ""
     if df.empty:
         print(f"\n{'='*80}")
         print(f"  [SKIP] Empty dataframe for dataset={dataset} target={target_model}"
-              f" draft={draft_model} topk={topk}")
+              f" draft={draft_model} topk={topk} steps={steps}")
         print(f"  Columns: {list(df.columns)}")
         print(f"{'='*80}")
         return
     print(f"\n{'='*80}")
-    print(f"  Dataset: {dataset}  target={target_model}{draft_str}{topk_str}  (n={int(df['num_samples'].iloc[0])})")
+    print(f"  Dataset: {dataset}  target={target_model}{draft_str}{topk_str}{steps_str}  (n={int(df['num_samples'].iloc[0])})")
     print(f"{'='*80}")
 
     fmt = {
@@ -260,20 +263,21 @@ def main():
     summary = build_summary(grouped, draft_models)
     summary = add_speedups(summary)
 
-    for (dataset, target_model, topk) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0)):
+    for (dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0, x[3] or 0)):
         if topk is not None:
-            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"] == topk)]
+            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"] == topk) & (summary["steps"] == steps)]
         else:
-            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"].isna())]
-        draft_model = draft_models.get((dataset, target_model, topk), "—")
-        print_dataset_table(dataset, target_model, draft_model, topk, ds_df)
+            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"].isna()) & (summary["steps"].isna())]
+        draft_model = draft_models.get((dataset, target_model, topk, steps), "—")
+        print_dataset_table(dataset, target_model, draft_model, topk, steps, ds_df)
 
-    # Overall averages across datasets, per (target_model, topk)
+    # Overall averages across datasets, per (target_model, topk, steps)
     spec_subset = summary[summary["topk"].notna()]
-    for (target_model, topk), subset in spec_subset.groupby(["target_model", "topk"]):
+    for (target_model, topk, steps), subset in spec_subset.groupby(["target_model", "topk", "steps"]):
         topk = int(topk)
+        steps = int(steps)
         print(f"\n{'='*80}")
-        print(f"  Overall target={target_model}  topk={topk} (averaged across datasets)")
+        print(f"  Overall target={target_model}  topk={topk}  steps={steps} (averaged across datasets)")
         print(f"{'='*80}")
         overall = subset.groupby("method")[
             ["avg_e2e", "avg_ttft", "avg_decode_time",
