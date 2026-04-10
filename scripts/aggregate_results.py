@@ -12,15 +12,27 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 # Known datasets (used to split dataset name from model name in AR filenames)
 DATASETS = {"gov_report", "narrativeqa", "pg19"}
 
+# Known GPU prefixes to strip from filenames
+GPU_PREFIXES = ["H100_", "A6000"]
+
 # Regex for speculative decoding filenames:
 #   [wo_graph_]standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}.csv
 SPEC_RE = re.compile(
-    r"^(wo_graph_)?standalone_(cascade|paged)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+)\.csv$"
+    r"^(wo_graph_)?standalone_(cascade|fasttree|paged)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+)\.csv$"
 )
+
+
+def strip_gpu_prefix(name: str) -> tuple[str, str]:
+    """Strip a known GPU prefix from filename, return (gpu, stripped_name)."""
+    for prefix in GPU_PREFIXES:
+        if name.startswith(prefix):
+            return prefix.rstrip("_"), name[len(prefix):]
+    return "", name
 
 
 def parse_filename(name: str) -> dict | None:
     """Return metadata dict or None if the file doesn't match any pattern."""
+    gpu, name = strip_gpu_prefix(name)
     m = SPEC_RE.match(name)
     if m:
         wo_graph = m.group(1) is not None
@@ -28,6 +40,7 @@ def parse_filename(name: str) -> dict | None:
         if wo_graph:
             method = f"{method}_wo_graph"
         return {
+            "gpu": gpu,
             "method": method,
             "target_model": m.group(3),
             "draft_model": m.group(4),
@@ -45,6 +58,7 @@ def parse_filename(name: str) -> dict | None:
                 target = target.removeprefix("wo_graph_")
             method = "ar_wo_graph" if wo_graph else "ar"
             return {
+                "gpu": gpu,
                 "method": method,
                 "target_model": target,
                 "draft_model": None,
@@ -55,17 +69,17 @@ def parse_filename(name: str) -> dict | None:
     return None
 
 
-def load_results(results_dir: Path) -> dict[tuple[str, str, int | None, int | None], dict[str, pd.DataFrame]]:
-    """Load CSVs grouped as {(dataset, target_model, topk, steps): {method: DataFrame}}.
+def load_results(results_dir: Path) -> dict[tuple[str, str, str, int | None, int | None], dict[str, pd.DataFrame]]:
+    """Load CSVs grouped as {(gpu, dataset, target_model, topk, steps): {method: DataFrame}}.
 
     AR results (topk=None, steps=None) are duplicated into every (topk, steps)
-    group for the same (dataset, target_model) so that speedup-vs-AR comparisons
+    group for the same (gpu, dataset, target_model) so that speedup-vs-AR comparisons
     work per group.
     """
     grouped = defaultdict(dict)
-    ar_by_key: dict[tuple[tuple[str, str], str], pd.DataFrame] = {}
-    spec_keys_by_target: dict[tuple[str, str], set[tuple[int, int]]] = defaultdict(set)
-    draft_models: dict[tuple[str, str, int, int], str] = {}
+    ar_by_key: dict[tuple[tuple[str, str, str], str], pd.DataFrame] = {}
+    spec_keys_by_target: dict[tuple[str, str, str], set[tuple[int, int]]] = defaultdict(set)
+    draft_models: dict[tuple[str, str, str, int, int], str] = {}
 
     for f in sorted(results_dir.glob("*.csv")):
         meta = parse_filename(f.name)
@@ -73,25 +87,25 @@ def load_results(results_dir: Path) -> dict[tuple[str, str, int | None, int | No
             continue
         df = pd.read_csv(f)
         df["decode_time"] = df["e2e"] - df["ttft"]
-        ds_target = (meta["dataset"], meta["target_model"])
+        gpu_ds_target = (meta["gpu"], meta["dataset"], meta["target_model"])
         if meta["topk"] is None:
-            ar_by_key[(ds_target, meta["method"])] = df
+            ar_by_key[(gpu_ds_target, meta["method"])] = df
         else:
-            key = (meta["dataset"], meta["target_model"], meta["topk"], meta["steps"])
+            key = (meta["gpu"], meta["dataset"], meta["target_model"], meta["topk"], meta["steps"])
             grouped[key][meta["method"]] = df
-            spec_keys_by_target[ds_target].add((meta["topk"], meta["steps"]))
+            spec_keys_by_target[gpu_ds_target].add((meta["topk"], meta["steps"]))
             if meta["draft_model"]:
                 draft_models[key] = meta["draft_model"]
 
     # Inject AR (and ar_wo_graph) into each (topk, steps) group
-    for ((dataset, target), method), df in ar_by_key.items():
-        keys = spec_keys_by_target.get((dataset, target))
+    for ((gpu, dataset, target), method), df in ar_by_key.items():
+        keys = spec_keys_by_target.get((gpu, dataset, target))
         if keys:
             for topk, steps in keys:
-                grouped[(dataset, target, topk, steps)][method] = df
+                grouped[(gpu, dataset, target, topk, steps)][method] = df
         else:
             # No spec results for this dataset+target, keep AR standalone
-            grouped[(dataset, target, None, None)][method] = df
+            grouped[(gpu, dataset, target, None, None)][method] = df
 
     return dict(grouped), draft_models
 
@@ -112,23 +126,24 @@ def aggregate(df: pd.DataFrame) -> pd.Series:
     return pd.Series(stats)
 
 
-def build_summary(grouped: dict[tuple[str, str, int | None, int | None], dict[str, pd.DataFrame]],
+def build_summary(grouped: dict[tuple[str, str, str, int | None, int | None], dict[str, pd.DataFrame]],
                    draft_models: dict) -> pd.DataFrame:
-    """Build a summary DataFrame with one row per (dataset, target_model, topk, steps, method)."""
+    """Build a summary DataFrame with one row per (gpu, dataset, target_model, topk, steps, method)."""
     rows = []
-    for (dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0, x[3] or 0)):
-        for method in sorted(grouped[(dataset, target_model, topk, steps)].keys()):
-            stats = aggregate(grouped[(dataset, target_model, topk, steps)][method])
+    for (gpu, dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2], x[3] or 0, x[4] or 0)):
+        for method in sorted(grouped[(gpu, dataset, target_model, topk, steps)].keys()):
+            stats = aggregate(grouped[(gpu, dataset, target_model, topk, steps)][method])
+            stats["gpu"] = gpu
             stats["dataset"] = dataset
             stats["target_model"] = target_model
-            stats["draft_model"] = draft_models.get((dataset, target_model, topk, steps), "—")
+            stats["draft_model"] = draft_models.get((gpu, dataset, target_model, topk, steps), "—")
             stats["topk"] = topk
             stats["steps"] = steps
             stats["method"] = method
             rows.append(stats)
     summary = pd.DataFrame(rows)
     # Reorder columns
-    cols = ["dataset", "target_model", "draft_model", "topk", "steps", "method", "num_samples", "avg_prompt_len",
+    cols = ["gpu", "dataset", "target_model", "draft_model", "topk", "steps", "method", "num_samples", "avg_prompt_len",
             "avg_e2e", "avg_ttft", "avg_decode_time",
             "avg_draft_time", "avg_verify_time",
             "avg_throughput", "avg_accept_length"]
@@ -138,7 +153,7 @@ def build_summary(grouped: dict[tuple[str, str, int | None, int | None], dict[st
 def add_speedups(summary: pd.DataFrame) -> pd.DataFrame:
     """Add speedup columns relative to AR and cascade-vs-paged."""
     rows = []
-    for (dataset, target_model, topk, steps), grp in summary.groupby(["dataset", "target_model", "topk", "steps"]):
+    for (gpu, dataset, target_model, topk, steps), grp in summary.groupby(["gpu", "dataset", "target_model", "topk", "steps"]):
         ar_row = grp[grp["method"] == "ar"]
         ar_wo_graph_row = grp[grp["method"] == "ar_wo_graph"]
         cascade_row = grp[grp["method"] == "cascade"]
@@ -178,21 +193,22 @@ def add_speedups(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def print_dataset_table(dataset: str, target_model: str, draft_model: str,
+def print_dataset_table(gpu: str, dataset: str, target_model: str, draft_model: str,
                         topk: int | None, steps: int | None, df: pd.DataFrame):
-    """Pretty-print summary for one dataset + target_model + topk + steps combination."""
+    """Pretty-print summary for one gpu + dataset + target_model + topk + steps combination."""
+    gpu_str = f"  gpu={gpu}" if gpu else ""
     topk_str = f"  topk={topk}" if topk is not None else ""
     steps_str = f"  steps={steps}" if steps is not None else ""
     draft_str = f"  draft={draft_model}" if draft_model and draft_model != "—" else ""
     if df.empty:
         print(f"\n{'='*80}")
-        print(f"  [SKIP] Empty dataframe for dataset={dataset} target={target_model}"
+        print(f"  [SKIP] Empty dataframe for{gpu_str} dataset={dataset} target={target_model}"
               f" draft={draft_model} topk={topk} steps={steps}")
         print(f"  Columns: {list(df.columns)}")
         print(f"{'='*80}")
         return
     print(f"\n{'='*80}")
-    print(f"  Dataset: {dataset}  target={target_model}{draft_str}{topk_str}{steps_str}  (n={int(df['num_samples'].iloc[0])})")
+    print(f"  Dataset: {dataset}  target={target_model}{draft_str}{topk_str}{steps_str}{gpu_str}  (n={int(df['num_samples'].iloc[0])})")
     print(f"{'='*80}")
 
     fmt = {
@@ -263,44 +279,13 @@ def main():
     summary = build_summary(grouped, draft_models)
     summary = add_speedups(summary)
 
-    for (dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2] or 0, x[3] or 0)):
+    for (gpu, dataset, target_model, topk, steps) in sorted(grouped, key=lambda x: (x[0], x[1], x[2], x[3] or 0, x[4] or 0)):
         if topk is not None:
-            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"] == topk) & (summary["steps"] == steps)]
+            ds_df = summary[(summary["gpu"] == gpu) & (summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"] == topk) & (summary["steps"] == steps)]
         else:
-            ds_df = summary[(summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"].isna()) & (summary["steps"].isna())]
-        draft_model = draft_models.get((dataset, target_model, topk, steps), "—")
-        print_dataset_table(dataset, target_model, draft_model, topk, steps, ds_df)
-
-    # Overall averages across datasets, per (target_model, topk, steps)
-    spec_subset = summary[summary["topk"].notna()]
-    for (target_model, topk, steps), subset in spec_subset.groupby(["target_model", "topk", "steps"]):
-        topk = int(topk)
-        steps = int(steps)
-        print(f"\n{'='*80}")
-        print(f"  Overall target={target_model}  topk={topk}  steps={steps} (averaged across datasets)")
-        print(f"{'='*80}")
-        overall = subset.groupby("method")[
-            ["avg_e2e", "avg_ttft", "avg_decode_time",
-             "avg_draft_time", "avg_verify_time",
-             "avg_throughput", "avg_accept_length"]
-        ].mean()
-        print(overall.to_string(float_format="%.3f"))
-
-    # AR overall per target_model (includes ar and ar_wo_graph)
-    ar_subset = summary[summary["method"].str.startswith("ar")]
-    for (target_model, method), subset in ar_subset.groupby(["target_model", "method"]):
-        # Deduplicate AR rows (they're duplicated into each topk group)
-        subset = subset.drop_duplicates(subset="dataset")
-        label = "AR" if method == "ar" else "AR (wo_graph)"
-        print(f"\n{'='*80}")
-        print(f"  Overall {label}  target={target_model} (averaged across datasets)")
-        print(f"{'='*80}")
-        overall = subset[
-            ["avg_e2e", "avg_ttft", "avg_decode_time",
-             "avg_draft_time", "avg_verify_time",
-             "avg_throughput", "avg_accept_length"]
-        ].mean()
-        print(overall.to_string(float_format="%.3f"))
+            ds_df = summary[(summary["gpu"] == gpu) & (summary["dataset"] == dataset) & (summary["target_model"] == target_model) & (summary["topk"].isna()) & (summary["steps"].isna())]
+        draft_model = draft_models.get((gpu, dataset, target_model, topk, steps), "—")
+        print_dataset_table(gpu, dataset, target_model, draft_model, topk, steps, ds_df)
 
     if args.output:
         summary.to_csv(args.output, index=False, float_format="%.4f")
