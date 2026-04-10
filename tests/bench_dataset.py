@@ -312,7 +312,7 @@ def print_summary(all_phase_results, args):
           f"{'-'*10}  {'-'*9}  {'-'*10}  "
           f"{'-'*8}  {'-'*7}  {'-'*8}  {'-'*9}")
 
-    for phase in ["original", "flat", "cascade_no_cg", "cascade"]:
+    for phase in ["original", "flat", "cascade_no_cg", "cascade", "fasttree"]:
         if phase not in phase_avgs:
             continue
         a = phase_avgs[phase]
@@ -322,7 +322,7 @@ def print_summary(all_phase_results, args):
         if orig_tps and phase != "original":
             vs_orig = f"{a['avg_throughput'] / orig_tps:.2f}x"
         vs_flat = ""
-        if flat_tps and phase in ("cascade", "cascade_no_cg"):
+        if flat_tps and phase in ("cascade", "cascade_no_cg", "fasttree"):
             vs_flat = f"{a['avg_throughput'] / flat_tps:.2f}x"
 
         draft_str = f"{a['avg_draft_time']:.3f}" if a['avg_draft_time'] > 0 else "-"
@@ -339,13 +339,14 @@ def print_summary(all_phase_results, args):
     print(f"{'='*90}")
 
     # CSV file listing
-    print(f"\n  CSV files in {args.result_dir}/:")
-    for phase in all_phase_results:
-        fname = csv_filename(phase, args)
-        fpath = os.path.join(args.result_dir, fname)
-        if os.path.exists(fpath):
-            print(f"    {fname}")
-    print()
+    if not getattr(args, "no_save", False):
+        print(f"\n  CSV files in {args.result_dir}/:")
+        for phase in all_phase_results:
+            fname = csv_filename(phase, args)
+            fpath = os.path.join(args.result_dir, fname)
+            if os.path.exists(fpath):
+                print(f"    {fname}")
+        print()
 
 
 def run_phase_subprocess(phase, argv):
@@ -387,14 +388,19 @@ def add_common_args(parser):
     parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
+    parser.add_argument("--skip", action="append", default=[],
+                        choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
+                        help="Skip one or more phases (repeatable, e.g. --skip cascade_no_cg --skip flat)")
     parser.add_argument("--time-spec", action="store_true",
                         help="Enable draft/verify timing (adds sync overhead)")
     parser.add_argument("--result-dir", default="results",
                         help="Directory for CSV output (default: results/)")
     parser.add_argument("--num-samples", type=int, default=None,
                         help="Limit number of prompts from the dataset")
-    parser.add_argument("--result-prefix", default="",
-                        help="Prefix for CSV filenames (e.g. 'wo_graph_')")
+    parser.add_argument("--result-prefix", required=True,
+                        help="Prefix for CSV filenames (e.g. 'H100_')")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Don't write CSV output files")
 
 
 def main():
@@ -426,11 +432,13 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade_no_cg", "cascade"]
+    phases = ["original", "flat", "cascade_no_cg", "cascade", "fasttree"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade_no_cg", "cascade"]
+        phases = ["flat", "cascade_no_cg", "cascade", "fasttree"]
+    if args.skip:
+        phases = [p for p in phases if p not in args.skip]
 
     forwarded_argv = sys.argv[1:]
 
@@ -444,10 +452,11 @@ def main():
         all_phase_results[phase] = results
 
         # Save CSV
-        fname = csv_filename(phase, args)
-        fpath = os.path.join(args.result_dir, fname)
-        write_csv(results, fpath)
-        print(f"  Results saved to {fpath}")
+        if not args.no_save:
+            fname = csv_filename(phase, args)
+            fpath = os.path.join(args.result_dir, fname)
+            write_csv(results, fpath)
+            print(f"  Results saved to {fpath}")
 
     # Print summary
     print_summary(all_phase_results, args)
