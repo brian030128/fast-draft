@@ -88,19 +88,29 @@ def dataset_short_name(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def temp_tag(temperature):
+    """Format temperature for filenames (e.g. 0.0 -> 'temp0', 0.7 -> 'temp0p7')."""
+    t = float(temperature)
+    if t == 0.0:
+        return "temp0"
+    return "temp" + f"{t:g}".replace(".", "p")
+
+
 def csv_filename(phase, args):
     """Generate CSV filename for a given phase."""
     prefix = getattr(args, "result_prefix", "") or ""
     target = model_short_name(args.model_path)
     ds = dataset_short_name(args.dataset_path)
+    bs = args.batch_size
+    temp = temp_tag(getattr(args, "temperature", 0.0))
     if phase == "original":
-        return f"{prefix}{target}_{ds}.csv"
+        return f"{prefix}{target}_{ds}_{temp}_bs{bs}.csv"
     else:
         method = "cascade" if phase == "cascade" else "cascade_no_cg" if phase == "cascade_no_cg" else "fasttree" if phase == "fasttree" else "paged"
         draft = model_short_name(args.draft_model_path)
         topk = args.eagle_topk or 4
         depth = args.speculative_num_steps or 10
-        return f"{prefix}standalone_{method}_{target}_{draft}_top{topk}_{depth}_{ds}.csv"
+        return f"{prefix}standalone_{method}_{target}_{draft}_top{topk}_{depth}_{ds}_{temp}_bs{bs}.csv"
 
 
 def run_phase(args, phase, records):
@@ -182,69 +192,89 @@ def run_phase(args, phase, records):
     if truncated:
         print(f"  Truncated {truncated}/{len(records)} prompts to {max_prompt_tokens} tokens")
 
+    temperature = getattr(args, "temperature", 0.0)
+
     # Warmup
     print("  Warmup ...")
     warmup_ids = all_input_ids[0][:256]
     engine.generate(
         input_ids=warmup_ids,
-        sampling_params={"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
+        sampling_params={"temperature": temperature, "max_new_tokens": 4, "ignore_eos": True},
     )
 
     results = []
     sampling_params = {
-        "temperature": 0,
+        "temperature": temperature,
         "max_new_tokens": args.max_new_tokens,
         "ignore_eos": True,
     }
 
-    for idx, rec in enumerate(records):
-        input_ids = all_input_ids[idx]
-        token_len = rec["token_len"]
+    import random
+    bs = args.batch_size
+    ttft_params = {"temperature": temperature, "max_new_tokens": 1, "ignore_eos": True}
+    for batch_start in range(0, len(records), bs):
+        batch_end = min(batch_start + bs, len(records))
+        batch_input_ids = [all_input_ids[i] for i in range(batch_start, batch_end)]
+        batch_records = [records[i] for i in range(batch_start, batch_end)]
+        B = len(batch_input_ids)
 
-        # Measure TTFT per-phase (speculative engines have different prefill cost)
-        import random
-        ttft_ids = list(input_ids)
-        random.Random(10000 + idx).shuffle(ttft_ids)
+        # Measure TTFT (batched). Shuffle each prompt so we don't hit prefix cache.
+        ttft_ids = []
+        for i, ids in enumerate(batch_input_ids):
+            shuffled = list(ids)
+            random.Random(10000 + batch_start + i).shuffle(shuffled)
+            ttft_ids.append(shuffled)
         t0 = time.perf_counter()
-        engine.generate(
-            input_ids=ttft_ids,
-            sampling_params={"temperature": 0, "max_new_tokens": 1, "ignore_eos": True},
-        )
-        ttft = time.perf_counter() - t0
+        if B == 1:
+            engine.generate(input_ids=ttft_ids[0], sampling_params=ttft_params)
+        else:
+            engine.generate(input_ids=ttft_ids, sampling_params=[ttft_params] * B)
+        ttft_batch = time.perf_counter() - t0
+        ttft_per = ttft_batch / B
 
-        # Timed generation
+        # Timed generation (batched)
         t0 = time.perf_counter()
-        out = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
-        e2e = time.perf_counter() - t0
+        if B == 1:
+            outs = [engine.generate(input_ids=batch_input_ids[0], sampling_params=sampling_params)]
+        else:
+            outs = engine.generate(input_ids=batch_input_ids, sampling_params=[sampling_params] * B)
+        e2e_batch = time.perf_counter() - t0
+        e2e_per = e2e_batch / B
 
-        meta = out["meta_info"]
-        completion_tokens = meta.get("completion_tokens", 0)
-        decode_time = max(e2e - ttft, 0.01)
-        throughput = completion_tokens / decode_time
-        draft_time = meta.get("spec_draft_time", 0)
-        verify_time = meta.get("spec_verify_time", 0)
-        spec_verify_ct = meta.get("spec_verify_ct", 0)
-        accept_length = meta.get("spec_accept_length", 0)
-        if accept_length == 0 and spec_verify_ct > 0:
-            accept_length = completion_tokens / spec_verify_ct
+        for i, out in enumerate(outs):
+            idx = batch_start + i
+            token_len = batch_records[i]["token_len"]
+            meta = out["meta_info"]
+            completion_tokens = meta.get("completion_tokens", 0)
+            decode_time = max(e2e_per - ttft_per, 0.01)
+            throughput = completion_tokens / decode_time
+            draft_time = meta.get("spec_draft_time", 0)
+            verify_time = meta.get("spec_verify_time", 0)
+            spec_verify_ct = meta.get("spec_verify_ct", 0)
+            accept_length = meta.get("spec_accept_length", 0)
+            if accept_length == 0 and spec_verify_ct > 0:
+                accept_length = completion_tokens / spec_verify_ct
 
-        results.append({
-            "prompt_idx": idx,
-            "prompt_len": token_len,
-            "completion_tokens": completion_tokens,
-            "e2e_s": e2e,
-            "ttft_s": ttft,
-            "decode_time_s": decode_time,
-            "draft_time_s": draft_time,
-            "verify_time_s": verify_time,
-            "throughput": throughput,
-            "accept_length": accept_length,
-        })
+            results.append({
+                "prompt_idx": idx,
+                "prompt_len": token_len,
+                "batch_size": bs,
+                "completion_tokens": completion_tokens,
+                "e2e_s": e2e_per,
+                "ttft_s": ttft_per,
+                "decode_time_s": decode_time,
+                "draft_time_s": draft_time,
+                "verify_time_s": verify_time,
+                "throughput": throughput,
+                "accept_length": accept_length,
+            })
 
-        if (idx + 1) % 10 == 0 or idx == len(records) - 1:
-            print(f"  [{idx+1}/{len(records)}] prompt_len={token_len}  "
-                  f"e2e={e2e:.2f}s  ttft={ttft:.2f}s  "
-                  f"decode={decode_time:.2f}s  tps={throughput:.1f}")
+        done = batch_end
+        if done % max(10, bs) < bs or done == len(records):
+            last = results[-1]
+            print(f"  [{done}/{len(records)}] bs={bs} prompt_len={last['prompt_len']}  "
+                  f"e2e={last['e2e_s']:.2f}s  ttft={last['ttft_s']:.2f}s  "
+                  f"decode={last['decode_time_s']:.2f}s  tps={last['throughput']:.1f}")
 
     engine.shutdown()
     return results
@@ -254,8 +284,8 @@ def write_csv(results, filepath):
     """Write per-prompt results to CSV."""
     os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
     fieldnames = [
-        "prompt_idx", "prompt_len", "e2e", "ttft", "draft_time", "verify_time",
-        "throughput", "accept_length",
+        "prompt_idx", "prompt_len", "batch_size", "e2e", "ttft",
+        "draft_time", "verify_time", "throughput", "accept_length",
     ]
     with open(filepath, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -264,6 +294,7 @@ def write_csv(results, filepath):
             writer.writerow({
                 "prompt_idx": r["prompt_idx"],
                 "prompt_len": r["prompt_len"],
+                "batch_size": r["batch_size"],
                 "e2e": f"{r['e2e_s']:.4f}",
                 "ttft": f"{r['ttft_s']:.4f}",
                 "draft_time": f"{r['draft_time_s']:.4f}",
@@ -380,10 +411,12 @@ def add_common_args(parser):
     parser.add_argument("--speculative-num-draft-tokens", type=int, default=None,
                         help="Verify budget (default: speculative_num_steps + 3)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Sampling temperature (0 = greedy)")
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--mem-fraction-static", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=1,
-                        help="(reserved for future batched inference)")
+                        help="Number of prompts to submit per engine.generate() call")
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
