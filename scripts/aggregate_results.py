@@ -13,12 +13,12 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 DATASETS = {"gov_report", "narrativeqa", "pg19"}
 
 # Known GPU prefixes to strip from filenames
-GPU_PREFIXES = ["H200_", "H100_", "A6000_"]
+GPU_PREFIXES = ["H200_", "H100_", "A6000_", "PRO6000_", "PRO6000"]
 
 # Regex for speculative decoding filenames:
 #   [wo_graph_]standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}[_temp{t}]_bs{bs}.csv
 SPEC_RE = re.compile(
-    r"^(wo_graph_)?standalone_(cascade_no_cg|cascade|fasttree|paged)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
+    r"^(wo_graph_)?standalone_(cascade_no_cg|cascade|fasttree|paged|vllm)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
 )
 
 
@@ -229,14 +229,8 @@ def add_speedups(summary: pd.DataFrame, grouped: dict) -> pd.DataFrame:
                     r["std_e2e_speedup_vs_ar"] = _per_sample_speedup_std(ar_df, m_df, "e2e")
                     r["std_decode_speedup_vs_ar"] = _per_sample_speedup_std(ar_df, m_df, "decode_time")
 
-            # Cascade/FastTree vs paged (within same graph/no-graph group)
-            if method == "cascade" and len(paged_row) > 0:
-                ref_paged = paged_row
-                ref_paged_method = "paged"
-            elif method == "cascade_no_cg" and len(paged_row) > 0:
-                ref_paged = paged_row
-                ref_paged_method = "paged"
-            elif method == "fasttree" and len(paged_row) > 0:
+            # Cascade/FastTree/vLLM vs paged (within same graph/no-graph group)
+            if method in ("cascade", "cascade_no_cg", "fasttree", "vllm") and len(paged_row) > 0:
                 ref_paged = paged_row
                 ref_paged_method = "paged"
             elif method == "cascade_wo_graph" and len(paged_wo_graph_row) > 0:
@@ -355,6 +349,19 @@ def print_dataset_table(gpu: str, dataset: str, target_model: str, draft_model: 
             e2e_std = f"±{r['std_e2e_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_ar")) else ""
             dec_std = f"±{r['std_decode_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_ar")) else ""
             print(f"  FastTree vs AR:    e2e {r['e2e_speedup_vs_ar']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_ar']:.3f}{dec_std}x")
+
+    # vLLM vs AR / vs Paged
+    vllm_row = df[df["method"] == "vllm"]
+    if len(vllm_row) > 0:
+        r = vllm_row.iloc[0]
+        if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
+            e2e_std = f"±{r['std_e2e_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_ar")) else ""
+            dec_std = f"±{r['std_decode_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_ar")) else ""
+            print(f"  vLLM vs AR:        e2e {r['e2e_speedup_vs_ar']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_ar']:.3f}{dec_std}x")
+        if "e2e_speedup_vs_paged" in r and pd.notna(r.get("e2e_speedup_vs_paged")):
+            e2e_std = f"±{r['std_e2e_speedup_vs_paged']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_paged")) else ""
+            dec_std = f"±{r['std_decode_speedup_vs_paged']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_paged")) else ""
+            print(f"  vLLM vs Paged:     e2e {r['e2e_speedup_vs_paged']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_paged']:.3f}{dec_std}x")
 
 
 def main():
