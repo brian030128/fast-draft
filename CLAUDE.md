@@ -44,7 +44,8 @@ fast-draft/
 ## Environment
 
 - **NEVER kill processes you don't own.** This is a shared multi-user system. Other users' processes may be running on GPUs. Only kill processes you started yourself.
-- **Before running on GPU**, run `nvidia-smi` to check which GPUs are free (0 MiB used), then use `CUDA_VISIBLE_DEVICES` to select only free GPUs (e.g. `CUDA_VISIBLE_DEVICES=2,3 uv run python ...`). If a GPU has memory in use, assume another user is using it and pick a different one.
+- **NEVER share a GPU with another user.** Even if memory looks like it would fit, co-locating workloads can tamper with their experiments (perf interference, OOM-kills, kernel collisions). Before running on GPU, run `nvidia-smi`; only use GPUs that report the idle baseline of ~2 MiB used (this is normal idle, not "in use"). Anything noticeably above that — even a few hundred MiB — means another user is on it; pick a different one. If no idle GPUs exist, stop and tell the user — do not start the run. Re-check `nvidia-smi` immediately before launching since the picture changes between commands.
+- Use `CUDA_VISIBLE_DEVICES` to pin to free GPUs (e.g. `CUDA_VISIBLE_DEVICES=2,3 uv run python ...`).
 - **CUDA 12.8 required.** The default system nvcc is 11.8 which is too old (missing `cuda/functional` header for FlashInfer JIT). Set `CUDA_HOME=/usr/local/cuda-12.8` when running GPU code.
 - **Always use `uv run python` to run scripts** (never bare `python`)
 - Python venv at `.venv/` (managed by `uv`)
