@@ -43,7 +43,7 @@ if __name__ == "__main__":
     # Sweep mode
     sweep_parser = subparsers.add_parser("sweep", help="Sweep depths × widths × topologies")
     sweep_parser.add_argument("--depths", type=int, nargs="+",
-                              default=[10, 12, 14, 16, 32])
+                              default=[10, 12, 14, 16, 20, 24, 32])
     sweep_parser.add_argument("--widths", type=int, nargs="+",
                               default=[4, 6, 8, 10, 12, 14, 16])
     sweep_parser.add_argument("--prompt_len", type=int, default=32768)
