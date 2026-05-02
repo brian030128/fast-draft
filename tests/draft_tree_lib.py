@@ -13,6 +13,7 @@ import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 import flashinfer
@@ -111,43 +112,60 @@ def build_lollipop_tree(stem_length: int, budget: int) -> List[Tuple[int, int]]:
     return edges
 
 
-def build_sampled_tree(depth: int, width: int, seed: int = None) -> List[Tuple[int, int]]:
-    """Tree-sampled topology: random speculative-decoding tree, budget = width * depth.
+def build_sampled_tree(
+    depth: int,
+    width: int,
+    seed: int = None,
+    alpha: float = 0.3,
+) -> List[Tuple[int, int]]:
+    """Beam-search-style tree sampling with realistic peaked next-token probs.
 
-    Simulates a probability-decaying expansion: at each depth, the total
-    number of new nodes decreases (Top-K style). Children are randomly
-    distributed among parents, so some parents get 0 children (pruned).
-    Total node budget is W*D.
+    Simulates speculative decoding via beam search with beam size = `width`.
+    Each beam's children get probabilities drawn from a Dirichlet(alpha)
+    distribution — small `alpha` makes the distribution peaky like real LLM
+    next-token output (alpha≈0.3 → top-3 tokens hold ~0.8 cumulative mass on
+    a 16-way simplex). Top-`width` candidates by accumulated log-prob from
+    root survive each step, so good prefixes attract many siblings (the
+    source of prefix sharing).
+
+    Each layer has exactly `width` nodes, giving total budget = width * depth.
     """
-    rng = random.Random(seed) if seed is not None else random.Random()
+    rng = np.random.default_rng(seed)
+    alphas = np.full(width, alpha)
 
-    budget = width * depth
     edges: List[Tuple[int, int]] = []
     next_id = 1
 
-    current_layer = [0]  # root
-    remaining_budget = budget
+    # Step 0: expand root into `width` children.
+    log_probs = np.log(rng.dirichlet(alphas))
+    # beams: list of (node_id, accumulated_log_prob_from_root)
+    beams: List[Tuple[int, float]] = []
+    for i in range(width):
+        edges.append((0, next_id))
+        beams.append((next_id, float(log_probs[i])))
+        next_id += 1
 
-    for d in range(depth):
-        if remaining_budget <= 0 or not current_layer:
-            break
-        # Determine how many total nodes this layer should have (decaying)
-        expected_layer_size = max(1, int(width * (0.6 ** d)))
-        n_nodes_this_layer = min(expected_layer_size, remaining_budget)
-        # Add some randomness: ±30%
-        lo = max(1, int(n_nodes_this_layer * 0.7))
-        hi = min(remaining_budget, int(n_nodes_this_layer * 1.3))
-        n_nodes_this_layer = rng.randint(lo, max(lo, hi))
+    # Steps 1..depth-1: each beam samples `width` children, keep top-`width`.
+    for _ in range(1, depth):
+        all_log_probs = np.log(np.stack(
+            [rng.dirichlet(alphas) for _ in range(len(beams))]
+        ))
 
-        # Randomly assign each new node to a parent from current_layer
-        new_layer = []
-        for _ in range(n_nodes_this_layer):
-            parent = rng.choice(current_layer)
-            edges.append((parent, next_id))
-            new_layer.append(next_id)
+        candidates: List[Tuple[int, float]] = []
+        for (parent_id, parent_acc), child_lps in zip(beams, all_log_probs):
+            for clp in child_lps:
+                candidates.append((parent_id, parent_acc + float(clp)))
+
+        # Keep top-`width` by accumulated log-prob.
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        top = candidates[:width]
+
+        new_beams = []
+        for parent_id, acc in top:
+            edges.append((parent_id, next_id))
+            new_beams.append((next_id, acc))
             next_id += 1
-            remaining_budget -= 1
-        current_layer = new_layer
+        beams = new_beams
 
     return edges
 

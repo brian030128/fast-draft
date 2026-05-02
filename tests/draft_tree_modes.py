@@ -203,7 +203,7 @@ def run_benchmark(
             for col, (topo_name, grid) in enumerate(zip(topo_names, grids)):
                 ax = axes[col]
                 im = ax.imshow(grid, cmap="RdBu", norm=norm,
-                               aspect="auto", origin="lower")
+                               aspect="equal", origin="lower")
                 ax.set_xticks(range(len(sorted_widths)))
                 ax.set_xticklabels(sorted_widths)
                 ax.set_yticks(range(len(sorted_depths)))
@@ -226,16 +226,13 @@ def run_benchmark(
                                 fontsize=8,
                                 color="white" if luminance < 0.5 else "black")
 
-            cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
-            cbar.set_label("Multi / Two (M/T) — center = 1.0")
+            fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
 
             plt.suptitle(
-                "Cascade Multi-Level vs Forced Two-Level (w/ CUDA Graph)\n"
-                f"prompt_len={prompt_len}, heads={num_qo_heads}/{num_kv_heads}, "
-                f"head_dim={head_dim}, page_size={page_size}",
+                "Multi-Level vs Forced Two-Level Attention (w/ CUDA Graph)",
                 fontsize=13, fontweight="bold",
             )
-            out_path = "draft_tree_benchmark.pgf"
+            out_path = "draft_tree_benchmark.svg"
             plt.savefig(out_path, bbox_inches="tight")
             print(f"\nPlot saved to {out_path}")
         except ImportError:
@@ -430,7 +427,7 @@ def sweep_stem_length(
                 fontsize=14, fontweight="bold",
             )
             plt.tight_layout()
-            out_path = "stem_sweep_benchmark.pgf"
+            out_path = "stem_sweep_benchmark.svg"
             plt.savefig(out_path, bbox_inches="tight")
             print(f"\nStem sweep plot saved to {out_path}")
         except ImportError:
@@ -581,8 +578,8 @@ def stress_test(
                          f"heads={num_qo_heads}/{num_kv_heads}, head_dim={head_dim}",
                          fontsize=12, fontweight="bold")
             plt.tight_layout()
-            plt.savefig("stress_test_benchmark.pgf", bbox_inches="tight")
-            print("\nStress test plot saved to stress_test_benchmark.pgf")
+            plt.savefig("stress_test_benchmark.svg", bbox_inches="tight")
+            print("\nStress test plot saved to stress_test_benchmark.svg")
         except ImportError:
             pass
 
