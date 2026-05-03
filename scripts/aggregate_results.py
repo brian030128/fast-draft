@@ -18,7 +18,7 @@ GPU_PREFIXES = ["H200_", "H100_", "A6000_", "PRO6000_", "PRO6000"]
 # Regex for speculative decoding filenames:
 #   [wo_graph_]standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}[_temp{t}]_bs{bs}.csv
 SPEC_RE = re.compile(
-    r"^(wo_graph_)?standalone_(cascade_no_cg|cascade|fasttree|paged|vllm)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
+    r"^(wo_graph_)?standalone_(cascade_per_step_no_cg|cascade_per_step|cascade_no_cg|cascade|fasttree|paged_no_cg|paged|vllm)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
 )
 
 
@@ -229,8 +229,9 @@ def add_speedups(summary: pd.DataFrame, grouped: dict) -> pd.DataFrame:
                     r["std_e2e_speedup_vs_ar"] = _per_sample_speedup_std(ar_df, m_df, "e2e")
                     r["std_decode_speedup_vs_ar"] = _per_sample_speedup_std(ar_df, m_df, "decode_time")
 
-            # Cascade/FastTree/vLLM vs paged (within same graph/no-graph group)
-            if method in ("cascade", "cascade_no_cg", "fasttree", "vllm") and len(paged_row) > 0:
+            # Cascade/FastTree/vLLM/paged_no_cg/cascade_per_step vs paged (within same graph/no-graph group)
+            if method in ("cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg",
+                          "fasttree", "vllm", "paged_no_cg") and len(paged_row) > 0:
                 ref_paged = paged_row
                 ref_paged_method = "paged"
             elif method == "cascade_wo_graph" and len(paged_wo_graph_row) > 0:
@@ -284,7 +285,8 @@ def print_dataset_table(gpu: str, dataset: str, target_model: str, draft_model: 
         """Format mean±std compactly."""
         return f"{mean:.3f}±{std:.3f}"
 
-    header = (f"{'Method':<10} {'PromptLen':>9} {'E2E(s)':>15} {'TTFT(s)':>15} {'Decode(s)':>15} "
+    method_w = max(10, max((len(str(m)) for m in df["method"]), default=10))
+    header = (f"{'Method':<{method_w}} {'PromptLen':>9} {'E2E(s)':>15} {'TTFT(s)':>15} {'Decode(s)':>15} "
               f"{'Draft(s)':>15} {'Verify(s)':>15} {'Tput(t/s)':>15} {'AcceptLen':>11}")
     print(header)
     print("-" * len(header))
@@ -292,7 +294,7 @@ def print_dataset_table(gpu: str, dataset: str, target_model: str, draft_model: 
     for _, row in df.iterrows():
         method = row["method"]
         line = (
-            f"{method:<10} "
+            f"{method:<{method_w}} "
             f"{row['avg_prompt_len']:>9.0f} "
             f"{ms(row['avg_e2e'], row['std_e2e']):>15} "
             f"{ms(row['avg_ttft'], row['std_ttft']):>15} "
@@ -340,6 +342,23 @@ def print_dataset_table(gpu: str, dataset: str, target_model: str, draft_model: 
             e2e_std = f"±{r['std_e2e_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_ar")) else ""
             dec_std = f"±{r['std_decode_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_ar")) else ""
             print(f"  Cascade (no_cg) vs AR:     e2e {r['e2e_speedup_vs_ar']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_ar']:.3f}{dec_std}x")
+
+    # cascade_per_step / cascade_per_step_no_cg vs AR / vs Paged
+    for method_name, label in [("cascade_per_step", "Cascade (per-step)"),
+                                ("cascade_per_step_no_cg", "Cascade (per-step, no_cg)")]:
+        row = df[df["method"] == method_name]
+        if len(row) == 0:
+            continue
+        r = row.iloc[0]
+        if "e2e_speedup_vs_ar" in r and pd.notna(r.get("e2e_speedup_vs_ar")):
+            e2e_std = f"±{r['std_e2e_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_ar")) else ""
+            dec_std = f"±{r['std_decode_speedup_vs_ar']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_ar")) else ""
+            print(f"  {label} vs AR:     e2e {r['e2e_speedup_vs_ar']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_ar']:.3f}{dec_std}x")
+        if "e2e_speedup_vs_paged" in r and pd.notna(r.get("e2e_speedup_vs_paged")):
+            e2e_std = f"±{r['std_e2e_speedup_vs_paged']:.3f}" if pd.notna(r.get("std_e2e_speedup_vs_paged")) else ""
+            dec_std = f"±{r['std_decode_speedup_vs_paged']:.3f}" if pd.notna(r.get("std_decode_speedup_vs_paged")) else ""
+            draft_std = f"±{r['std_draft_speedup_vs_paged']:.3f}" if pd.notna(r.get("std_draft_speedup_vs_paged")) else ""
+            print(f"  {label} vs Paged:  e2e {r['e2e_speedup_vs_paged']:.3f}{e2e_std}x  decode {r['decode_speedup_vs_paged']:.3f}{dec_std}x  draft {r['draft_speedup_vs_paged']:.3f}{draft_std}x")
 
     # FastTree vs AR
     fasttree_row = df[df["method"] == "fasttree"]

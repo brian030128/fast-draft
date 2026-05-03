@@ -106,7 +106,20 @@ def csv_filename(phase, args):
     if phase == "original":
         return f"{prefix}{target}_{ds}_{temp}_bs{bs}.csv"
     else:
-        method = "cascade" if phase == "cascade" else "cascade_no_cg" if phase == "cascade_no_cg" else "fasttree" if phase == "fasttree" else "paged"
+        if phase == "cascade":
+            method = "cascade"
+        elif phase == "cascade_no_cg":
+            method = "cascade_no_cg"
+        elif phase == "cascade_per_step":
+            method = "cascade_per_step"
+        elif phase == "cascade_per_step_no_cg":
+            method = "cascade_per_step_no_cg"
+        elif phase == "flat_no_cg":
+            method = "paged_no_cg"
+        elif phase == "fasttree":
+            method = "fasttree"
+        else:
+            method = "paged"
         draft = model_short_name(args.draft_model_path)
         topk = args.eagle_topk or 4
         depth = args.speculative_num_steps or 10
@@ -118,12 +131,21 @@ def run_phase(args, phase, records):
     # Reset all draft env vars
     os.environ["SGLANG_CASCADE_DRAFT"] = "0"
     os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "0"
+    os.environ["SGLANG_CASCADE_PER_STEP_DRAFT"] = "0"
+    os.environ["SGLANG_CASCADE_PER_STEP_DRAFT_NO_CG"] = "0"
+    os.environ["SGLANG_FLAT_DRAFT_NO_CG"] = "0"
     os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
 
     if phase == "cascade":
         os.environ["SGLANG_CASCADE_DRAFT"] = "1"
     elif phase == "cascade_no_cg":
         os.environ["SGLANG_CASCADE_DRAFT_NO_CG"] = "1"
+    elif phase == "cascade_per_step":
+        os.environ["SGLANG_CASCADE_PER_STEP_DRAFT"] = "1"
+    elif phase == "cascade_per_step_no_cg":
+        os.environ["SGLANG_CASCADE_PER_STEP_DRAFT_NO_CG"] = "1"
+    elif phase == "flat_no_cg":
+        os.environ["SGLANG_FLAT_DRAFT_NO_CG"] = "1"
     elif phase == "fasttree":
         os.environ["SGLANG_FASTTREE_DRAFT"] = "1"
 
@@ -154,6 +176,12 @@ def run_phase(args, phase, records):
         phase_info = "  (no speculation)"
     elif phase == "cascade_no_cg":
         phase_info = "  (SGLANG_CASCADE_DRAFT_NO_CG=1, no CUDA graph for attn)"
+    elif phase == "cascade_per_step":
+        phase_info = "  (SGLANG_CASCADE_PER_STEP_DRAFT=1, per-step plan, CG)"
+    elif phase == "cascade_per_step_no_cg":
+        phase_info = "  (SGLANG_CASCADE_PER_STEP_DRAFT_NO_CG=1, per-step plan, no CG)"
+    elif phase == "flat_no_cg":
+        phase_info = "  (SGLANG_FLAT_DRAFT_NO_CG=1, no CUDA graph for attn)"
     elif phase == "fasttree":
         phase_info = f"  (SGLANG_FASTTREE_DRAFT={os.environ.get('SGLANG_FASTTREE_DRAFT', '0')})"
     else:
@@ -343,17 +371,22 @@ def print_summary(all_phase_results, args):
           f"{'-'*10}  {'-'*9}  {'-'*10}  "
           f"{'-'*8}  {'-'*7}  {'-'*8}  {'-'*9}")
 
-    for phase in ["original", "flat", "cascade_no_cg", "cascade", "fasttree"]:
+    for phase in ["original", "flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]:
         if phase not in phase_avgs:
             continue
         a = phase_avgs[phase]
-        label = "paged" if phase == "flat" else phase
+        if phase == "flat":
+            label = "paged"
+        elif phase == "flat_no_cg":
+            label = "paged_no_cg"
+        else:
+            label = phase
 
         vs_orig = ""
         if orig_tps and phase != "original":
             vs_orig = f"{a['avg_throughput'] / orig_tps:.2f}x"
         vs_flat = ""
-        if flat_tps and phase in ("cascade", "cascade_no_cg", "fasttree"):
+        if flat_tps and phase in ("cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "flat_no_cg", "fasttree"):
             vs_flat = f"{a['avg_throughput'] / flat_tps:.2f}x"
 
         draft_str = f"{a['avg_draft_time']:.3f}" if a['avg_draft_time'] > 0 else "-"
@@ -418,11 +451,11 @@ def add_common_args(parser):
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Number of prompts to submit per engine.generate() call")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--only", choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
+    parser.add_argument("--only", choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
     parser.add_argument("--skip", action="append", default=[],
-                        choices=["original", "flat", "cascade", "cascade_no_cg", "fasttree"],
+                        choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree"],
                         help="Skip one or more phases (repeatable, e.g. --skip cascade_no_cg --skip flat)")
     parser.add_argument("--time-spec", action="store_true",
                         help="Enable draft/verify timing (adds sync overhead)")
@@ -465,11 +498,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "cascade_no_cg", "cascade", "fasttree"]
+    phases = ["original", "flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "cascade_no_cg", "cascade", "fasttree"]
+        phases = ["flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
     if args.skip:
         phases = [p for p in phases if p not in args.skip]
 
