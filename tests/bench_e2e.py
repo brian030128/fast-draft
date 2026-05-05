@@ -253,6 +253,7 @@ def run_phase(args, phase: str):
                 "phase": phase,
                 "prompt_len": prompt_len,
                 "request_idx": i,
+                "batch_size": args.batch_size,
                 "input_tokens": len(input_ids_batch[i]),
                 "completion_tokens": completion_tokens,
                 "e2e_latency_s": e2e,

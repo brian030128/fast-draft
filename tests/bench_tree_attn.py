@@ -30,7 +30,12 @@ sys.path.insert(0, os.path.join(_root, "3rdparty", "flashinfer"))
 sys.path.insert(0, os.path.join(_root, "3rdparty", "FastTree-Artifact", "kernel_bench"))
 
 import flashinfer
-from flashinfer.attention import CascadeBatchAttentionWrapper
+try:
+    from flashinfer import (
+        FusedMultiLevelCascadeAttentionWrapper as CascadeBatchAttentionWrapper,
+    )
+except ImportError:
+    from flashinfer.attention import CascadeBatchAttentionWrapper
 from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
 
 from kv_tree_simple import KVTreeNode

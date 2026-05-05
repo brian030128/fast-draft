@@ -70,19 +70,48 @@ def build_min_sharing_tree(depth: int, width: int) -> List[Tuple[int, int]]:
 
 
 def build_max_sharing_tree(depth: int, width: int) -> List[Tuple[int, int]]:
-    """Maximum-sharing tree: long lollipop (single stem + leaf burst at tip).
+    """Maximum-sharing tree: two stems from root with asymmetric leaf load.
 
-    Depth 1..(D-1): single stem (no branching).
-    Depth D: burst remaining budget at the tip.
+    Stem A: (D-1) sequential nodes + 1 leaf.
+    Stem B: (D-1) sequential nodes + burst of remaining leaves.
     Total nodes = W * D.
-    Every leaf shares the entire (D-1)-long stem prefix — among the three
-    topologies this has the *most* prefix sharing across leaves.
 
-    Multi-Level merges the stem into one level → only 2 extra levels total.
-    Forced Two-Level: each leaf reads O(D) redundant stem KV → Memory Wall.
+    Branches at two distinct depths (root, and tip of stem B) so there is
+    *no* single all-query-shared prefix beyond the prompt — neither Two-Level
+    nor any metadata-folding trick can collapse this below 3 cascade levels.
+    Stem B is read N-1 times redundantly under Two-Level, exposing the
+    real Memory Wall effect.
     """
     budget = depth * width
-    return build_lollipop_tree(depth - 1, budget)
+    stem_len = depth - 1
+    burst = budget - 2 * stem_len - 1
+    assert burst >= 1, (
+        f"need budget >= 2*(D-1)+2, got D={depth}, W={width} (budget={budget})"
+    )
+
+    edges: List[Tuple[int, int]] = []
+    next_id = 1
+
+    # Stem A + 1 leaf
+    parent = 0
+    for _ in range(stem_len):
+        edges.append((parent, next_id))
+        parent = next_id
+        next_id += 1
+    edges.append((parent, next_id))
+    next_id += 1
+
+    # Stem B + burst
+    parent = 0
+    for _ in range(stem_len):
+        edges.append((parent, next_id))
+        parent = next_id
+        next_id += 1
+    for _ in range(burst):
+        edges.append((parent, next_id))
+        next_id += 1
+
+    return edges
 
 
 def build_lollipop_tree(stem_length: int, budget: int) -> List[Tuple[int, int]]:

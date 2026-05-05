@@ -62,12 +62,12 @@ def run_benchmark(
     total_configs = len(depths) * len(widths) * 3
     done = 0
 
-    for width in widths:
-        for depth in depths:
-            for topo_name, builder_fn in [
-                ("Minimum Sharing", build_min_sharing_tree),
-                ("Maximum Sharing", build_max_sharing_tree),
-            ]:
+    for topo_name, builder_fn in [
+        ("Maximum Sharing", build_max_sharing_tree),
+        ("Minimum Sharing", build_min_sharing_tree),
+    ]:
+        for width in widths:
+            for depth in depths:
                 edges = builder_fn(depth, width)
                 kv_data, prompt_pages, node_page_map = allocate_kv_cache_and_pages(
                     edges, prompt_len, num_kv_heads, head_dim, page_size, dtype,
@@ -106,7 +106,9 @@ def run_benchmark(
                       f"two={two_ms:.4f}ms  M/T={speedup:.2f}x  "
                       f"(levels={multi_meta['num_levels']}, leaves={total_q})")
 
-            # Tree-Sampled topology: Monte Carlo with N random SD-style samples
+    # Tree-Sampled topology: Monte Carlo with N random SD-style samples per (W, D)
+    for width in widths:
+        for depth in depths:
             rand_multi_total = 0.0
             rand_two_total = 0.0
             for sample_i in range(random_n):

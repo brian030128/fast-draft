@@ -11,7 +11,6 @@ Since we modify CascadeAttention itself, we maintain a FlashInfer fork in `3rdpa
 ### Experiments
 
 1. **SGLang EAGLE tree draft kernel swap (done):** Replace SGLang's paged attention tree draft kernel with our batched cascade attention and measure speedup. Benchmark: `tests/bench_e2e.py`.
-2. **MagicDec: sequential → tree draft with cascade attention (in progress):** MagicDec is a sequential long-context speculative decoding system. We convert it to tree draft using our cascade attention approach and compare against sequential draft speed, to show that our approach lowers tree draft time enough that even sequential methods should switch to tree drafting. Currently only the cascade attention path is integrated in MagicDec; the pure paged attention tree draft baseline is not yet added.
 
 ## What This Does
 
@@ -31,7 +30,6 @@ fast-draft/
           cascade_index_gen.py # Triton kernels for 2-level cascade KV indices
         layers/attention/
           flashinfer_cascade_backend.py  # CascadeMultiStepDraftBackend
-    MagicDec/                  # Fork of MagicDec with cascade attention for tree draft
     flashinfer/                # Fork of FlashInfer with CascadeBatchAttentionWrapper
   tests/
     test_cascade_indices.py    # Unit tests for index generation (21 tests)

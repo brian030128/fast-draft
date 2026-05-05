@@ -46,7 +46,7 @@ from bench_tree_attn import (
     build_flashinfer_cascade_indices,
     bench_ms,
 )
-from tree_categories import ARCHETYPES, all_cells
+from tree_categories import ARCHETYPES, all_cells, build_multi_level_cascade_indices
 
 
 def run_cell(
@@ -68,6 +68,7 @@ def run_cell(
         "batch": data["batch_size"],
         "max_seq": data["max_seqlen"],
         "flat_us": None, "cascade_us": None, "ml_cascade_us": None,
+        "num_levels": 2,
     }
 
     # --- Flat ---
@@ -88,14 +89,46 @@ def run_cell(
         out_buf = torch.empty_like(q)
         result["flat_us"] = bench_ms(lambda: flat_wrapper.run(q, kv_data, out=out_buf)) * 1000.0
 
-    # --- Cascade indices (shared by cascade + ml_cascade paths) ---
+    # --- Cascade indices: prefer the multi-level builder (one cascade
+    # level per tree depth) so deep archetypes like eagle_pyramid get to
+    # share at every depth. Falls back to the 2-level builder when the
+    # tree has variable leaf depth (pyramid OK; variable_depth falls back).
     casc_idx = None
+    cascade_levels = 2
     if "cascade" not in skip or "ml_cascade" not in skip:
-        casc_idx = build_flashinfer_cascade_indices(tree_info, data, num_prefixes=1, topk=1)
+        ml_idx = build_multi_level_cascade_indices(tree_info, data)
+        if ml_idx is not None and ml_idx["num_levels"] >= 2:
+            casc_idx = {
+                "qo_indptr_arr": ml_idx["qo_indptr_arr"],
+                "kv_indptr_arr": ml_idx["kv_indptr_arr"],
+                "kv_indices_arr": ml_idx["kv_indices_arr"],
+                "kv_len_arr": ml_idx["kv_len_arr"],
+                "last_page_len_arr": ml_idx["last_page_len_arr"],
+                "q_reorder": ml_idx["q_reorder"],
+                "ordered_req_indices": ml_idx["ordered_req_indices"],
+            }
+            cascade_levels = ml_idx["num_levels"]
+        else:
+            # variable-depth fallback
+            two = build_flashinfer_cascade_indices(tree_info, data, num_prefixes=1, topk=1)
+            casc_idx = {
+                "qo_indptr_arr": two["qo_indptr_arr"],
+                "kv_indptr_arr": two["kv_indptr_arr"],
+                "kv_indices_arr": two["kv_indices_arr"],
+                "kv_len_arr": two["kv_len_arr"],
+                "last_page_len_arr": [two["shared_last_page_len"], two["unique_last_page_len"]],
+                "q_reorder": two["q_reorder"],
+                "ordered_req_indices": two["ordered_req_indices"],
+            }
+            cascade_levels = 2
         q_casc = casc_idx["q_reorder"]
+    result["num_levels"] = cascade_levels
 
     if "cascade" not in skip:
-        cascade = CascadeBatchAttentionWrapper(num_levels=2, kv_layout="NHD", device="cuda")
+        cascade = CascadeBatchAttentionWrapper(
+            num_levels=cascade_levels, kv_layout="NHD", device="cuda",
+            max_levels=max(cascade_levels, 4),
+        )
         cascade.plan(
             qo_indptr_arr=casc_idx["qo_indptr_arr"],
             kv_indptr_arr=casc_idx["kv_indptr_arr"],
@@ -119,7 +152,7 @@ def run_cell(
 
     if "ml_cascade" not in skip:
         ml_cascade = MultiLevelCascadeAttentionWrapper(
-            num_levels=2,
+            num_levels=cascade_levels,
             float_workspace_buffer=torch.zeros(512 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
             kv_layout="NHD",
         )
@@ -127,9 +160,7 @@ def run_cell(
             qo_indptr_arr=casc_idx["qo_indptr_arr"],
             paged_kv_indptr_arr=casc_idx["kv_indptr_arr"],
             paged_kv_indices_arr=casc_idx["kv_indices_arr"],
-            paged_kv_last_page_len=[
-                casc_idx["shared_last_page_len"], casc_idx["unique_last_page_len"]
-            ],
+            paged_kv_last_page_len=casc_idx["last_page_len_arr"],
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -158,7 +189,7 @@ def fmt_us(v):
 
 def print_table(rows: List[dict]):
     header = (
-        f"  {'archetype[params]':40s}  {'batch':>5s}  {'max_seq':>7s}  "
+        f"  {'archetype[params]':40s}  {'batch':>5s}  {'max_seq':>7s}  L  "
         f"{'flat us':>9s}  {'cascade us':>10s}  {'ml_casc us':>10s}  "
         f"{'casc/flat':>9s}  {'casc/ml':>9s}  beneficial?"
     )
@@ -171,7 +202,7 @@ def print_table(rows: List[dict]):
         if r["flat_us"] is not None and r["cascade_us"] is not None:
             beneficial = "YES" if r["cascade_us"] < r["flat_us"] * 0.95 else "no"
         print(
-            f"  {r['label']:40s}  {r['batch']:>5d}  {r['max_seq']:>7d}  "
+            f"  {r['label']:40s}  {r['batch']:>5d}  {r['max_seq']:>7d}  {r['num_levels']:>1d}  "
             f"{fmt_us(r['flat_us'])}  {fmt_us(r['cascade_us'])}  {fmt_us(r['ml_cascade_us'])}  "
             f"{fmt_ratio(r['cascade_us'], r['flat_us']):>9s}  "
             f"{fmt_ratio(r['cascade_us'], r['ml_cascade_us']):>9s}  {beneficial}"
@@ -234,7 +265,7 @@ def main():
             rows.append(r)
         except Exception as e:
             print(f"  FAIL {label}: {type(e).__name__}: {e}")
-            rows.append({"label": label, "batch": 0, "max_seq": 0,
+            rows.append({"label": label, "batch": 0, "max_seq": 0, "num_levels": 0,
                          "flat_us": None, "cascade_us": None, "ml_cascade_us": None})
 
     print_table(rows)

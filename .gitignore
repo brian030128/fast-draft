@@ -8,3 +8,9 @@ traces/
 *.nsys-rep
 results.json
 trace_out.json
+.claude/
+results/
+b_results/
+data/
+logs/
+reports/

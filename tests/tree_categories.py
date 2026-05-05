@@ -331,3 +331,160 @@ def all_cells() -> List[Tuple[str, Callable, dict]]:
         for label, kwargs in expand_archetype(name):
             out.append((label, builder, kwargs))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-level cascade index builder
+# ---------------------------------------------------------------------------
+#
+# The 2-level builder in bench_tree_attn.py groups by `tuple(chain[:-1])`,
+# which collapses any depth>2 tree into a 2-level cascade and breaks
+# sharing for shapes like the EAGLE pyramid (each leaf's full prefix
+# becomes its unique key -> 64 groups of 1 query for pyramid 1->8->4->2->1).
+# For deep trees we want one cascade level per tree depth so the fused
+# wrapper can share at every depth where it's possible.
+#
+# Strategy:
+#   1. DFS-order the leaves so groups at every depth are contiguous in
+#      query space.
+#   2. Compute each leaf's root-to-leaf chain.
+#   3. Require uniform chain length (variable-depth caller falls back to
+#      the 2-level path -- variable-depth multi-level needs participation
+#      masks which the wrapper supports but the bench scaffolding doesn't
+#      yet).
+#   4. For each depth d in [0, D]: group leaves by their ancestor at
+#      depth d. The group's queries = all leaves with that ancestor
+#      (contiguous thanks to DFS). The group's kv_indices = the
+#      depth-d node's tokens.
+#   5. Return per-level lists shaped for `cascade.plan(num_levels=D+1)`.
+
+def _dfs_order_leaves(tree_info) -> List[int]:
+    """Return leaf node indices in DFS order, deterministic by node id."""
+    children_of: Dict[int, List[int]] = {}
+    for n, node in enumerate(tree_info):
+        children_of.setdefault(node.parent, []).append(n)
+    for v in children_of.values():
+        v.sort(key=lambda i: tree_info[i].id)
+    out: List[int] = []
+    stack = list(reversed(children_of.get(-1, [])))  # roots
+    while stack:
+        n = stack.pop()
+        kids = children_of.get(n, [])
+        if not kids:
+            out.append(n)
+        else:
+            for k in reversed(kids):
+                stack.append(k)
+    return out
+
+
+def build_multi_level_cascade_indices(tree_info, data):
+    """Build per-depth cascade indices for the fused / ml-cascade wrappers.
+
+    Returns a dict shaped like build_flashinfer_cascade_indices but with
+    `num_levels` entries in each per-level list. Returns None when the
+    tree has variable leaf depth (caller should fall back to 2-level).
+
+    Output dict keys (all CUDA tensors / lists thereof):
+      qo_indptr_arr: List[Tensor]  -- per-level qo group indptr
+      kv_indptr_arr: List[Tensor]  -- per-level kv group indptr
+      kv_indices_arr: List[Tensor] -- per-level kv page indices (page_size=1)
+      kv_len_arr: List[Tensor]     -- per-level kv lens per group
+      last_page_len_arr: List[Tensor] -- ml_cascade compat (all ones)
+      q_reorder: Tensor            -- Q reordered to DFS leaf order
+      ordered_req_indices: List[int]
+      num_levels: int
+    """
+    import torch
+
+    leaf_paths = data["leaf_paths"]
+    kv_ptrs = data["kv_ptrs"]
+    if not leaf_paths:
+        return None
+
+    ordered_leaves = _dfs_order_leaves(tree_info)
+    # Map original-request-id (== leaf order in leaf_paths) to its DFS position.
+    # leaf_paths' order matches the iteration order in prepare_data's
+    # leaf-detection loop, which itself follows tree_info's node order; we
+    # need to remap.
+    leaf_to_req_id: Dict[int, int] = {}
+    for req_id, chain in enumerate(leaf_paths):
+        leaf_to_req_id[chain[-1]] = req_id  # last node in chain is the leaf
+
+    ordered_req_indices = [leaf_to_req_id[leaf_node] for leaf_node in ordered_leaves]
+    ordered_chains = [leaf_paths[r] for r in ordered_req_indices]
+
+    chain_lens = {len(c) for c in ordered_chains}
+    if len(chain_lens) > 1:
+        return None  # variable depth -> caller falls back to 2-level
+
+    D_plus_1 = chain_lens.pop()  # number of nodes in each chain == cascade levels
+    num_levels = D_plus_1
+    if num_levels < 2:
+        return None  # need >= 2 levels for the cascade kernel
+
+    qo_indptr_arr = []
+    kv_indptr_arr = []
+    kv_indices_arr = []
+    kv_len_arr = []
+    last_page_len_arr = []
+
+    for d in range(num_levels):
+        # Walk DFS-ordered leaves and group consecutively by ancestor at depth d.
+        groups: List[Tuple[int, int]] = []  # (ancestor_node_idx, num_leaves_in_group)
+        cur_anc = None
+        cur_count = 0
+        for chain in ordered_chains:
+            anc = chain[d]
+            if anc != cur_anc:
+                if cur_anc is not None:
+                    groups.append((cur_anc, cur_count))
+                cur_anc = anc
+                cur_count = 1
+            else:
+                cur_count += 1
+        if cur_anc is not None:
+            groups.append((cur_anc, cur_count))
+
+        qo_indptr = [0]
+        for _, n in groups:
+            qo_indptr.append(qo_indptr[-1] + n)
+
+        kv_lens: List[int] = []
+        kv_indices_list = []
+        for ancestor, _ in groups:
+            sl = tree_info[ancestor].seqlen
+            start = kv_ptrs[ancestor]
+            kv_indices_list.append(
+                torch.arange(start, start + sl, dtype=torch.int32, device="cuda")
+            )
+            kv_lens.append(sl)
+
+        qo_indptr_arr.append(torch.tensor(qo_indptr, dtype=torch.int32, device="cuda"))
+        kv_indices_arr.append(
+            torch.cat(kv_indices_list)
+            if kv_indices_list
+            else torch.zeros(0, dtype=torch.int32, device="cuda")
+        )
+        kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+        kv_len_arr.append(kv_lens_t)
+        kv_indptr = torch.zeros(len(groups) + 1, dtype=torch.int32, device="cuda")
+        if kv_lens:
+            torch.cumsum(kv_lens_t, dim=0, out=kv_indptr[1:])
+        kv_indptr_arr.append(kv_indptr)
+        last_page_len_arr.append(
+            torch.ones(len(groups), dtype=torch.int32, device="cuda")
+        )
+
+    q_reorder = data["q"][ordered_req_indices]
+
+    return {
+        "qo_indptr_arr": qo_indptr_arr,
+        "kv_indptr_arr": kv_indptr_arr,
+        "kv_indices_arr": kv_indices_arr,
+        "kv_len_arr": kv_len_arr,
+        "last_page_len_arr": last_page_len_arr,
+        "q_reorder": q_reorder,
+        "ordered_req_indices": ordered_req_indices,
+        "num_levels": num_levels,
+    }

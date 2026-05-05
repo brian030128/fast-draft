@@ -5,13 +5,6 @@
 [submodule "3rdparty/sglang"]
 	path = 3rdparty/sglang
 	url = git@github.com:brian030128/sglang.git
-[submodule "3rdparty/MagicDec"]
-	path = 3rdparty/MagicDec
-	url = git@github.com:brian030128/MagicDec.git
-	branch = fast-draft
-[submodule "3rdparty/vllm"]
-	path = 3rdparty/vllm
-	url = git@github.com:shadowpa0327/vllm.git
 [submodule "3rdparty/DeFT"]
 	path = 3rdparty/DeFT
 	url = git@github.com:LINs-lab/DeFT.git
