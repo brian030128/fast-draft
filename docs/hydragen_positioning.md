@@ -21,10 +21,20 @@ correction. We do not claim that primitive. Hydragen established it; FlashInfer'
 cascade wrappers and Flash-Decoding's split-K are the same idea. We cite Hydragen as
 its origin and state explicitly that our contribution is *not* the decomposition math.
 
-We verify the primitive really is identical rather than merely similar:
-`tests/bench_hydragen_paged.py` runs Hydragen's own `combine_lse` (imported verbatim
-from `3rdparty/hydragen`) against FlashInfer's `merge_state` on the same inputs and
-reports the difference. Treat "same primitive" as a measured fact, not a concession.
+We verify the primitive really is identical rather than merely similar.
+`tests/bench_hydragen_paged.py` computes attention over prefix+suffix as a reference,
+then merges the separately-computed prefix and suffix parts with each implementation:
+
+| merge implementation                      | max rel error vs full attention |
+|-------------------------------------------|--------------------------------:|
+| FlashInfer `merge_state`                  | 7.911e-04 (exact, fp16 rounding) |
+| Hydragen `combine_lse`, LSE × ln 2        | 7.911e-04 (identical residual)   |
+| Hydragen `combine_lse_triton`, LSE × ln 2 | 7.911e-04 (identical residual)   |
+
+Hydragen's own merge kernel, imported verbatim, reproduces FlashInfer's result to the
+last digit; the only discrepancy is a log base convention (FlashInfer carries the LSE in
+log2, Hydragen in natural log). So "same primitive" is a measured fact here, not a
+rhetorical concession.
 
 What is new is **the workload we apply it to and what that workload forces us to
 build**: the tree-draft decode step of speculative decoding. Hydragen's implementation

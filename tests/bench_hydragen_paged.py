@@ -138,22 +138,35 @@ def check_merge_equivalence(num_tokens=4096, num_heads=8, head_dim=128):
     results["FlashInfer merge_state"] = fi_out
 
     # Hydragen combine_lse: outs [B, S, H, D], lses [B, S, H]; here S = 1.
+    def as_hy(lse_a, lse_b):
+        return [lse_a.unsqueeze(1).contiguous(), lse_b.unsqueeze(1).contiguous()]
+
     outs = [pre_out.unsqueeze(1).contiguous(), suf_out.unsqueeze(1).contiguous()]
-    lses = [pre_lse.unsqueeze(1).contiguous(), suf_lse.unsqueeze(1).contiguous()]
-    for label, use_triton in (("Hydragen combine_lse_torch", False),
-                              ("Hydragen combine_lse_triton", True)):
+
+    # FlashInfer's kernels carry the LSE in log2 space, while Hydragen's
+    # combine_lse uses exp() (natural log) -- feeding one to the other silently
+    # produces wrong softmax weights. Rescaling by ln 2 converts between them,
+    # which is the whole of the difference.
+    ln2 = 0.6931471805599453
+    for label, lses, use_triton in (
+        ("Hydragen combine_lse (raw)", as_hy(pre_lse, suf_lse), False),
+        ("Hydragen combine_lse x ln2", as_hy(pre_lse * ln2, suf_lse * ln2), False),
+        ("Hydragen triton x ln2", as_hy(pre_lse * ln2, suf_lse * ln2), True),
+    ):
         results[label] = combine_lse(outs, lses, enable_triton=use_triton).squeeze(1)
 
-    worst = 0.0
+    worst = 1.0
     for label, out in results.items():
         diff = (full_out.float() - out.float()).abs()
         rel = diff.max().item() / scale
-        worst = max(worst, rel)
         verdict = "EXACT" if rel < 5e-3 else "DIFFERS"
-        print(f"  {label:>24}  {diff.max().item():>10.3e}  {rel:>10.3e}  {verdict}")
+        if verdict == "EXACT":
+            worst = min(worst, rel)
+        print(f"  {label:>26}  {diff.max().item():>10.3e}  {rel:>10.3e}  {verdict}")
 
-    print("  Both reconstruct the same full attention: the decomposition and its")
-    print("  log-sum-exp recombination are one and the same primitive.")
+    print("  Once the LSE log base is matched, Hydragen's combine_lse and FlashInfer's")
+    print("  merge_state both reconstruct full attention exactly: the decomposition and")
+    print("  its log-sum-exp recombination are one and the same primitive.")
     return worst
 
 

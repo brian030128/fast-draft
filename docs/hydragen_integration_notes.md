@@ -184,12 +184,54 @@ the primitive, adds the missing baseline, and shows the contribution is the part
 makes the primitive actually pay off inside a serving engine — rather than claiming
 the primitive.
 
-## Merge primitive
+## Merge primitive — provably the same, up to the log base
 
-`combine_lse` (Hydragen, verbatim) vs `merge_state` (FlashInfer) on identical inputs —
-see experiment 1 in `tests/bench_hydragen_paged.py`. The reference `combine_lse_torch`
-path is the one that decides whether the primitive is the same; Hydragen's own fused
-`combine_lse_triton` kernel is reported alongside it.
+Test (experiment 1 in `tests/bench_hydragen_paged.py`): run real attention over
+prefix(2048)+suffix(4) as the reference, then run it over each half separately and merge
+the two partial results. A merge implements the same primitive iff it reconstructs the
+reference.
+
+| merge implementation                    | max abs   | max rel   | verdict |
+|-----------------------------------------|----------:|----------:|---------|
+| FlashInfer `merge_state`                | 1.221e-04 | 7.911e-04 | EXACT   |
+| Hydragen `combine_lse` (raw LSE)        | 2.028e-02 | 1.315e-01 | DIFFERS |
+| Hydragen `combine_lse`, LSE × ln 2      | 1.221e-04 | 7.911e-04 | EXACT   |
+| Hydragen `combine_lse_triton`, LSE × ln 2 | 1.221e-04 | 7.911e-04 | EXACT |
+
+**FlashInfer carries the LSE in log2 space; Hydragen's `combine_lse` uses `exp()`, i.e.
+natural log.** Rescale by ln 2 and the two agree to the last digit — identical residual
+against the reference. That is the whole of the difference.
+
+Two consequences:
+
+* The "we concede the primitive" statement is now a *measured* fact, not a rhetorical
+  concession: Hydragen's own merge kernel, imported verbatim, reproduces FlashInfer's
+  result exactly. Say this plainly in related work.
+* Practical footgun worth a footnote: feeding a FlashInfer LSE to a natural-log merge
+  (or vice versa) silently produces wrong softmax weights — ~13% relative error here,
+  with no error raised. My first version of this test made exactly that mistake and
+  reported "DIFFERS" for both Hydragen variants.
+
+## Draft/verify breakdown (`--time-spec`)
+
+Same configuration, n=10:
+
+| phase      | draft (s) | verify (s) | tok/s | accept |
+|------------|----------:|-----------:|------:|-------:|
+| `paged`    | 0.992     | 1.035      | 217.8 | 4.64   |
+| `hydragen` | 2.379     | 1.005      | 139.4 | 4.63   |
+| `cascade`  | 0.713     | 1.005      | 259.3 | 4.64   |
+
+Verify time is constant (1.005–1.035 s) and accept length is constant (4.63–4.64), so the
+entire effect is in the draft step, which is the only thing any of these backends touch.
+Hydragen's decomposition *increases* draft time 0.992 → 2.379 s even though its kernel is
+4.6× faster, and Fast Draft's draft step is **3.34× faster than the Hydragen port**.
+
+Note for attribution (and to keep this consistent with `ablation_report.md`): against
+*SGLang-default* the differential is mostly the cascade kernel (1.68×) with plan-once
+contributing only 1.10×. Against a *Hydragen-style* baseline the weighting flips, because
+Hydragen plans two wrappers per draft step and has no plan-once. Both are true; always say
+which baseline an attribution is relative to.
 
 ## Open items
 
