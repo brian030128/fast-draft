@@ -31,6 +31,18 @@ export HF_HOME=/tmp/${USER}/hf
 export HF_HUB_CACHE=${HF_HOME}/hub
 mkdir -p "${HF_HUB_CACHE}"
 unset HF_HUB_OFFLINE
+
+# meta-llama repos are gated, and moving HF_HOME orphans the stored credential
+# (it lives under the *old* cache dir). Read it from $HOME -- that filesystem is
+# out of write space, not unreadable -- and pass it through the environment.
+_tok=/home/u4320956/.cache/huggingface/token
+if [ -z "${HF_TOKEN:-}" ] && [ -r "${_tok}" ]; then
+    HF_TOKEN=$(cat "${_tok}")
+    export HF_TOKEN
+fi
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "WARNING: no HF token found; gated repos (meta-llama/*) will 401" >&2
+fi
 # Triton/FlashInfer/SGLang JIT caches also land on node-local disk, so a full
 # $HOME cannot stall a compile mid-job.
 export TRITON_CACHE_DIR=/tmp/${USER}/triton
