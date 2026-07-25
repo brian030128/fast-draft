@@ -62,6 +62,7 @@ def create_engine(
         "log_level": "warning",
         "enable_metrics": True,
         "kv_cache_dtype": kv_cache_dtype,
+        "disable_piecewise_cuda_graph": True,
     }
     if context_length is not None:
         kwargs["context_length"] = context_length

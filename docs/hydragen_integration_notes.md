@@ -1,0 +1,165 @@
+# Integrating Hydragen into SGLang: what happened, what it cost, what to say
+
+Working notes from actually doing the integration the reviewer asked for. Numbers are
+H100 80GB HBM3, `tests/bench_hydragen_paged.py`, `num_seqs=4 topk=5 step_offset=3`,
+32 query heads / 8 KV heads / head_dim 128, fp16, page_size 1.
+
+## Summary
+
+Hydragen's *algorithm* ports to SGLang cleanly and is a strong baseline — 3.2×–4.7×
+over SGLang's own paged draft attention at the kernel level. Hydragen's
+*implementation* does not port at all, for one concrete reason (contiguous caches) and
+one structural reason (CUDA-graph invalidation on prefix-length change). Both are
+quantified below and both are usable in the rebuttal.
+
+The uncomfortable finding is in the other direction too: **one claim in the previous
+positioning draft was simply wrong** (the "tree causal mask" gap). It has been removed.
+See `hydragen_positioning.md`.
+
+## Challenge 1 — Hydragen's reference code does not import
+
+`hydragen/flash.py` does
+`from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_varlen_forward`.
+This environment has no flash-attn: `flash_attn` resolves to a namespace package
+containing only `flash_attn/cute` (the CuTe DSL), with no `flash_attn_interface`.
+
+*Impact:* `hydragen_attention` cannot be executed here at all, so "run Hydragen's code
+as a baseline" is not available as-is.
+
+*What we did:* stubbed `hydragen.flash` in `sys.modules` so `combine_lse` — which only
+needs torch/triton/einops — can be imported verbatim from Hydragen's real source file.
+That is enough to check the merge primitive, which is the only part of Hydragen we
+actually need to compare against.
+
+*Gotcha worth recording:* loading the file with `exec(compile(src, ...))` instead of a
+real import breaks Triton. Triton's JIT resolves a kernel's source through
+`inspect`/`linecache`; under `exec` its dependency finder walks the wrong function body
+and dies with `RuntimeError: Unsupported function referenced: <built-in method stack>`
+(it hits the `torch.stack` inside `combine_lse_torch`). Use a `sys.modules` stub, not
+`exec`.
+
+*Rebuttal value:* low on its own. Do not write "we could not run Hydragen" — that reads
+as an excuse. Use it only to justify why the comparison is against a *port*.
+
+## Challenge 2 — contiguous shared/unique caches vs a paged pool (the real blocker)
+
+`hydragen_attention` takes `shared_ks[i]` as `[sbatch, slen, kvheads, head_dim]` and
+`k` as `[batch, kvlen, kvheads, head_dim]` — dense tensors, pre-sized by `setup_caches`
+and filled by `append_shared`. SGLang has one paged pool; a prefix is a scattered list
+of page ids. A faithful port must gather.
+
+Measured gather cost (K and V, `index_select` from the pool, per layer):
+
+| prefix | gather / layer | achieved BW | per draft iteration (16 layers × 3 steps) |
+|--------|----------------|-------------|--------------------------------------------|
+| 4 096  | 0.053 ms       | 2517 GB/s   | 2.56 ms                                     |
+| 16 384 | 0.189 ms       | 2847 GB/s   | 9.05 ms                                     |
+| 50 000 | 0.558 ms       | 2936 GB/s   | 26.78 ms                                    |
+
+Two things to note, and **be precise about both**:
+
+1. The gather runs at ~2.9 TB/s, close to H100 HBM peak. It is memory-bound and cannot
+   be engineered away — it moves the whole prefix KV.
+2. It is a **tax, not a wall**. At prefix 50K a gathering Hydragen port would cost
+   0.558 + 0.794 = 1.35 ms/layer against SGLang-flat's 3.71 ms — still 2.7× faster,
+   down from 4.7×. Claiming Hydragen "cannot work" would overstate it; claiming it
+   "gives up ~40% of its own advantage and needs ~0.8 GB of scratch per layer" is both
+   true and sufficient.
+
+The sharper framing: a page index is **4 bytes per token**, the KV it points at is
+`2 × 8 × 128 × 2 = 4096` bytes per token — a **1024× ratio**. Expressing the two-level
+split as index arrays (our `cascade_index_gen.py`, 2 Triton kernels per draft
+iteration, ~microseconds) instead of gathering (26.8 ms per draft iteration at 50K
+context) is the entire reason this is viable inside a serving engine. That contrast —
+26.8 ms vs microseconds — is the number to put in the rebuttal.
+
+## Challenge 3 — Hydragen's CUDA graphs break when the shared prefix grows
+
+Hydragen does support CUDA graphs (`GraphedHydragenLlamaModel`), so we must not claim
+CUDA graphs as such. But its capture key includes each shared cache's
+`sliced_sequence_length`, and `forward()` calls `invalidate()` + re-captures whenever it
+changes. Hydragen's own comment in `SharedCache.__init__`:
+
+> "This involves slicing the varlen KV cache to extract the relevant part, which can
+> lead to CUDA graph invalidations when varlen is off and the length of the shared
+> prompt changes (see `GraphedHydragenLlamaModel`)."
+
+In Hydragen's setting the shared prompt is fixed for the whole generation loop, so this
+never fires. In speculative decoding the shared prefix grows every accepted-token
+iteration, so it would fire *every* iteration — a full model re-capture per decode
+step.
+
+This is exactly the axis the reviewer identified as the true novelty, and it is worth
+leaning into rather than deflecting: the static-planning machinery in
+`flashinfer_cascade_backend.py` exists because a two-level decomposition whose shared
+length changes every step is otherwise incompatible with CUDA graphs.
+
+Supporting number — plan cost is *not* negligible at draft-decode scale:
+
+| prefix | attention (hydragen-paged) | plan (hydragen-paged) | plan / attention |
+|--------|----------------------------|-----------------------|------------------|
+| 4 096  | 0.098 ms                   | 0.456 ms              | 4.7×             |
+| 16 384 | 0.279 ms                   | 0.460 ms              | 1.6×             |
+| 50 000 | 0.794 ms                   | 0.464 ms              | 0.6×             |
+
+At short contexts the FlashInfer scheduler costs several times the attention itself.
+Plan runs once per draft step (amortized over layers) while attention runs per layer,
+so this is not a direct ratio — but it shows why "just call `plan()` every step",
+which is what a straight Hydragen port does, is the wrong design at small prefix.
+
+## Challenge 4 — FlashInfer pins a wrapper to one batch size under CUDA graphs
+
+`BatchPrefillWithPagedKVCacheWrapper` records `_fixed_batch_size` at construction and
+raises if `plan()` is later called with a different batch size. SGLang captures ~23
+distinct batch sizes, so the Hydragen backend needs one wrapper set per captured batch
+size: 23 × 3 steps × 2 levels = 138 wrappers, each of which would allocate its own 8 MB
+int workspace **and** an 8 MB pinned host buffer — over 2 GB.
+
+*Fix:* allocate int/pinned workspaces once per `(step, level)` and assign them onto each
+wrapper directly, bypassing `reset_workspace_buffer` (which allocates a fresh pinned
+buffer per call). 6 × 8 MB instead of 138 × 16 MB.
+
+They may **not** be shared across *steps*: all draft steps are planned before the single
+captured graph replays them, so step *i*'s schedule has to survive step *i+1*'s
+`plan()`. They may be shared across batch sizes, because each captured graph is
+replayed immediately after its own `plan()`.
+
+Similarly, level-0 page indices are identical for every draft step within an iteration
+(the shared prefix does not grow *within* a draft loop), so one level-0 index buffer is
+enough; level-1 indices differ per step and need per-step buffers.
+
+*Rebuttal value:* moderate. It is engineering, not science, but it is concrete evidence
+that "just use Hydragen" is not a five-line change in a real engine.
+
+## Kernel-level results
+
+| prefix | SGLang flat | Hydragen-paged | Fast Draft cascade | hy/flat | cascade/hy |
+|--------|-------------|----------------|--------------------|---------|------------|
+| 4 096  | 0.316 ms    | 0.098 ms       | 0.086 ms           | 3.22×   | 1.14×      |
+| 16 384 | 1.231 ms    | 0.279 ms       | 0.138 ms           | 4.42×   | 2.02×      |
+| 50 000 | 3.713 ms    | 0.794 ms       | 0.419 ms           | 4.68×   | 1.90×      |
+
+Read this honestly: **most of the kernel-level win is Hydragen's idea, not ours.**
+Adding Hydragen-paged as a baseline drops our headline kernel speedup from ~4.7× (vs
+SGLang) to ~1.9× (vs Hydragen). That is the number the reviewer is entitled to, and the
+paper is stronger for reporting it than for having it discovered in review.
+
+The remaining 1.9× is the fused two-level kernel (one pass, no separate
+`merge_state_in_place` round-trip through HBM) plus static planning. Note it *grows*
+with prefix length, which is the regime the paper targets.
+
+## Merge primitive
+
+`combine_lse` (Hydragen, verbatim) vs `merge_state` (FlashInfer) on identical inputs —
+see experiment 1 in `tests/bench_hydragen_paged.py`. The reference `combine_lse_torch`
+path is the one that decides whether the primitive is the same; Hydragen's own fused
+`combine_lse_triton` kernel is reported alongside it.
+
+## Open items
+
+* E2E numbers for the `hydragen` phase (`SGLANG_HYDRAGEN_DRAFT=1`) — the kernel-level
+  gap above says the E2E gap should be smaller, since draft attention is only part of a
+  draft step.
+* The gather baseline is measured, not implemented as a running backend. If a reviewer
+  pushes, implementing `SGLANG_HYDRAGEN_GATHER_DRAFT=1` would make the "faithful
+  Hydragen" column real rather than derived.
