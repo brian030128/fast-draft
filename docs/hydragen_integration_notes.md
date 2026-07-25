@@ -148,6 +148,42 @@ The remaining 1.9× is the fused two-level kernel (one pass, no separate
 `merge_state_in_place` round-trip through HBM) plus static planning. Note it *grows*
 with prefix length, which is the regime the paper targets.
 
+## E2E results — the headline
+
+Llama-3.1-8B target + Llama-3.2-1B draft, STANDALONE spec decode, topk=5, depth=4,
+narrativeqa 50k (avg prompt 55 682 tokens), bs=2, H100, `--num-samples 8`.
+
+| phase                     | decode (s) | tok/s | accept | vs SGLang paged |
+|---------------------------|-----------:|------:|-------:|----------------:|
+| `paged` (SGLang baseline) | 0.68       | 194.7 | 4.45   | —               |
+| `hydragen_no_cg`          | 1.40       | 106.4 | 4.42   | 0.55×           |
+| `hydragen` (CUDA graphs)  | 0.99       | 129.6 | 4.42   | 0.67×           |
+| `cascade` (Fast Draft)    | 0.53       | 240.5 | 4.45   | **1.23×**       |
+
+Three things to take from this.
+
+**1. The Hydragen backend is numerically correct.** Accept length is 4.42 against the
+baseline's 4.45 — the draft tree is the same tree. A broken attention implementation
+would collapse acceptance. This validates the port, so the timing numbers mean
+something.
+
+**2. Hydragen's decomposition, ported faithfully, is a net *loss* end-to-end** — 0.67×
+of SGLang's own paged draft attention, despite being 4.68× faster at the kernel level
+(see the table above). The kernel win is real and it is Hydragen's; it just does not
+survive contact with the draft loop, because the loop re-plans both cascade levels on
+every one of the 3 draft steps, every decode iteration. CUDA graphs recover part of it
+(0.55× → 0.67×) but cannot elide the planning, which happens on the host before replay.
+
+**3. That gap is exactly what the paper's static planning closes.** Fast Draft is
+1.23× the baseline and **1.85× the Hydragen-paged port** (240.5 / 129.6) — with the
+decomposition math held constant between the two. The two backends differ only in
+per-step planning vs plan-once-and-patch, and the fused vs separate merge.
+
+This is a much better answer to the reviewer than the previous framing. It concedes
+the primitive, adds the missing baseline, and shows the contribution is the part that
+makes the primitive actually pay off inside a serving engine — rather than claiming
+the primitive.
+
 ## Merge primitive
 
 `combine_lse` (Hydragen, verbatim) vs `merge_state` (FlashInfer) on identical inputs —

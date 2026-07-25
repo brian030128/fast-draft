@@ -140,6 +140,40 @@ the `hydragen` vs `cascade` columns in the E2E table, which differ *only* on thi
 `hydragen` → `cascade` isolates our contribution with the decomposition math held
 constant. `flat` → `hydragen` shows what Hydragen's idea alone buys in this regime.
 
+## Measured: what the added baseline actually shows
+
+Kernel level (H100, bs=4, topk=5, 32q/8kv heads, head_dim 128, fp16):
+
+| prefix | SGLang flat | Hydragen-paged | Fast Draft | hy/flat | cascade/hy |
+|--------|------------:|---------------:|-----------:|--------:|-----------:|
+| 4 096  | 0.314 ms    | 0.100 ms       | 0.086 ms   | 3.14×   | 1.16×      |
+| 16 384 | 1.250 ms    | 0.289 ms       | 0.135 ms   | 4.32×   | 2.13×      |
+| 50 000 | 3.754 ms    | 0.810 ms       | 0.392 ms   | 4.63×   | 2.07×      |
+
+End to end (Llama-3.1-8B + Llama-3.2-1B, STANDALONE, topk=5, depth=4, narrativeqa
+50k, avg prompt 55 682 tokens, bs=2, H100):
+
+| phase                     | decode (s) | tok/s | accept | vs SGLang paged |
+|---------------------------|-----------:|------:|-------:|----------------:|
+| `paged` (SGLang baseline) | 0.68       | 194.7 | 4.45   | —               |
+| `hydragen_no_cg`          | 1.40       | 106.4 | 4.42   | 0.55×           |
+| `hydragen` (CUDA graphs)  | 0.99       | 129.6 | 4.42   | 0.67×           |
+| `cascade` (Fast Draft)    | 0.53       | 240.5 | 4.45   | **1.23×**       |
+
+The honest reading, which is also the strongest one:
+
+* **Most of the kernel-level win is Hydragen's, not ours.** Against the right baseline
+  our kernel advantage is ~2×, not the ~4.6× we get against SGLang. Report this.
+* **Hydragen's decomposition alone is a net loss end to end** (0.67× of the SGLang
+  baseline) even though it is 4.6× faster in the kernel, because the draft loop
+  re-plans both levels on all 3 draft steps of every decode iteration. CUDA graphs
+  recover part of it (0.55× → 0.67×) but cannot elide host-side planning.
+* **The gap between 0.67× and 1.23× is the contribution.** The two backends differ
+  only in per-step planning vs plan-once-and-patch (and fused vs separate merge), so
+  1.85× is a clean measurement of what the paper adds.
+* Accept length is unchanged (4.42 vs 4.45), so the Hydragen port is a correct
+  implementation, not a strawman.
+
 ## Suggested related-work sentence
 
 > Hydragen [Juravsky et al., 2024] introduced shared-prefix attention decomposition —
