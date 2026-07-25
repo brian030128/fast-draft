@@ -214,7 +214,15 @@ Two consequences:
 
 ## Draft/verify breakdown (`--time-spec`)
 
-Same configuration, n=10:
+Same configuration, n=10. Instruct models, two independent runs (~1% apart):
+
+| phase      | draft (s) | verify (s) | tok/s         | accept |
+|------------|----------:|-----------:|--------------:|-------:|
+| `paged`    | 1.127     | 1.184      | 183.7 / 182.2 | 3.96   |
+| `hydragen` | 2.837     | 1.178      | 113.1 / 113.9 | 3.93   |
+| `cascade`  | 0.852     | 1.189      | 211.8 / 211.2 | 3.94   |
+
+Base models, same configuration:
 
 | phase      | draft (s) | verify (s) | tok/s | accept |
 |------------|----------:|-----------:|------:|-------:|

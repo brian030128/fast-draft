@@ -53,8 +53,19 @@ backend** (`SGLANG_HYDRAGEN_DRAFT=1`), on FlashInfer's
 workspace patching: Hydragen's algorithm with none of our additions. So
 `hydragen → cascade` isolates our contribution with the decomposition held constant.
 
-**E2E** (Llama-3.1-8B + Llama-3.2-1B, STANDALONE, topk=5, depth=4, narrativeqa 50k,
-avg prompt 55 664 tokens, bs=2, H100, `--time-spec`, n=10):
+**E2E**, STANDALONE, topk=5, depth=4, narrativeqa 50k, avg prompt 55 664 tokens,
+bs=2, H100, `--time-spec`, n=10.
+
+Llama-3.1-8B-Instruct + Llama-3.2-1B-Instruct (two independent runs, jobs 278505 and
+the node-local rerun — reproducible to ~1%):
+
+| phase                     | draft (s) | verify (s) | tok/s       | accept | vs paged |
+|---------------------------|----------:|-----------:|------------:|-------:|---------:|
+| `paged` (SGLang default)  | 1.127     | 1.184      | 183.7 / 182.2 | 3.96 | —        |
+| `hydragen` (CUDA graphs)  | 2.837     | 1.178      | 113.1 / 113.9 | 3.93 | 0.62×    |
+| `cascade` (Fast Draft)    | 0.852     | 1.189      | 211.8 / 211.2 | 3.94 | 1.15×    |
+
+Llama-3.1-8B + Llama-3.2-1B (base models, same configuration):
 
 | phase                     | draft (s) | verify (s) | tok/s | accept | vs paged |
 |---------------------------|----------:|-----------:|------:|-------:|---------:|
