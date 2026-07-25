@@ -1,10 +1,15 @@
 #!/bin/bash
 # Hydragen vs Fast Draft comparison, launched with srun (see run_hydragen_srun.sh).
 #
-# HF_HOME points at /work rather than $HOME: the home quota is 100 GB and full,
-# and /work already holds the complete Llama-3.1-8B-Instruct / 3.2-1B-Instruct
-# snapshots. Weights are resolved (and downloaded, if anything is missing) on
-# the compute node, not the login node.
+# Weights go on NODE-LOCAL storage. Neither shared filesystem is usable here:
+#   $HOME  -- 100 GB quota, full, and its Llama-3.1-8B-Instruct snapshot is
+#             missing 3 of 4 shards (this killed jobs 278387 and 278400).
+#   /work  -- a weka mount that is not reliably visible from the workers; the
+#             same path on hgpn01 showed 8.0K used in one allocation and 71 GB
+#             in another, so reading weights from it works only by luck.
+# /tmp on the workers is a real local block device (/dev/md131, 28 TB, ~1% used)
+# and SLURM_TMPDIR is unset on this cluster, so /tmp/$USER is the path to use.
+# Weights are resolved -- and downloaded if absent -- on the allocated GPU node.
 
 set -uo pipefail
 
@@ -22,10 +27,15 @@ export CXX=${GCC_HOME}/bin/g++
 export CUDAHOSTCXX=${GCC_HOME}/bin/g++
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
-# Weights live on /work, which has room; $HOME does not.
-export HF_HOME=/work/u4320956/hf
-export HF_HUB_CACHE=/work/u4320956/hf/hub
+export HF_HOME=/tmp/${USER}/hf
+export HF_HUB_CACHE=${HF_HOME}/hub
+mkdir -p "${HF_HUB_CACHE}"
 unset HF_HUB_OFFLINE
+# Triton/FlashInfer/SGLang JIT caches also land on node-local disk, so a full
+# $HOME cannot stall a compile mid-job.
+export TRITON_CACHE_DIR=/tmp/${USER}/triton
+export FLASHINFER_WORKSPACE_BASE=/tmp/${USER}/flashinfer
+mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_BASE}"
 
 WT=/home/u4320956/fast-draft/.claude/worktrees/hydragen-compare
 export PYTHONPATH=${WT}/3rdparty/sglang/python
@@ -35,9 +45,9 @@ TARGET=meta-llama/Llama-3.1-8B-Instruct
 DRAFT=meta-llama/Llama-3.2-1B-Instruct
 
 echo
-echo "=== HF cache ==="
-echo "HF_HOME=$HF_HOME"
-df -h /work/u4320956 | tail -1
+echo "=== node-local cache ==="
+echo "HF_HOME=$HF_HOME  (SLURM_TMPDIR=${SLURM_TMPDIR:-unset})"
+df -h /tmp | tail -1
 
 echo
 echo "=== 0/2 resolve weights on this node (downloads only what is missing) ==="
