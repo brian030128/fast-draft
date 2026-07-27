@@ -127,6 +127,10 @@ def csv_filename(phase, args):
             method = "paged_no_cg"
         elif phase == "fasttree":
             method = "fasttree"
+        elif phase == "hydragen":
+            method = "hydragen"
+        elif phase == "hydragen_no_cg":
+            method = "hydragen_no_cg"
         else:
             method = "paged"
         draft = model_short_name(args.draft_model_path)
@@ -144,6 +148,8 @@ def run_phase(args, phase, records):
     os.environ["SGLANG_CASCADE_PER_STEP_DRAFT_NO_CG"] = "0"
     os.environ["SGLANG_FLAT_DRAFT_NO_CG"] = "0"
     os.environ.pop("SGLANG_FASTTREE_DRAFT", None)
+    os.environ["SGLANG_HYDRAGEN_DRAFT"] = "0"
+    os.environ["SGLANG_HYDRAGEN_DRAFT_NO_CG"] = "0"
 
     if phase == "cascade":
         os.environ["SGLANG_CASCADE_DRAFT"] = "1"
@@ -157,6 +163,10 @@ def run_phase(args, phase, records):
         os.environ["SGLANG_FLAT_DRAFT_NO_CG"] = "1"
     elif phase == "fasttree":
         os.environ["SGLANG_FASTTREE_DRAFT"] = "1"
+    elif phase == "hydragen":
+        os.environ["SGLANG_HYDRAGEN_DRAFT"] = "1"
+    elif phase == "hydragen_no_cg":
+        os.environ["SGLANG_HYDRAGEN_DRAFT_NO_CG"] = "1"
 
     os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
@@ -193,6 +203,10 @@ def run_phase(args, phase, records):
         phase_info = "  (SGLANG_FLAT_DRAFT_NO_CG=1, no CUDA graph for attn)"
     elif phase == "fasttree":
         phase_info = f"  (SGLANG_FASTTREE_DRAFT={os.environ.get('SGLANG_FASTTREE_DRAFT', '0')})"
+    elif phase == "hydragen":
+        phase_info = "  (SGLANG_HYDRAGEN_DRAFT=1, Hydragen decomposition baseline, CG)"
+    elif phase == "hydragen_no_cg":
+        phase_info = "  (SGLANG_HYDRAGEN_DRAFT_NO_CG=1, Hydragen decomposition baseline, no CG)"
     else:
         phase_info = f"  (SGLANG_CASCADE_DRAFT={os.environ.get('SGLANG_CASCADE_DRAFT', '0')})"
     print(f"  Phase: {phase.upper()}{phase_info}")
@@ -383,7 +397,7 @@ def print_summary(all_phase_results, args):
           f"{'-'*10}  {'-'*9}  {'-'*10}  "
           f"{'-'*8}  {'-'*7}  {'-'*8}  {'-'*9}")
 
-    for phase in ["original", "flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]:
+    for phase in ["original", "flat", "flat_no_cg", "hydragen_no_cg", "hydragen", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]:
         if phase not in phase_avgs:
             continue
         a = phase_avgs[phase]
@@ -398,7 +412,7 @@ def print_summary(all_phase_results, args):
         if orig_tps and phase != "original":
             vs_orig = f"{a['avg_throughput'] / orig_tps:.2f}x"
         vs_flat = ""
-        if flat_tps and phase in ("cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "flat_no_cg", "fasttree"):
+        if flat_tps and phase in ("cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "flat_no_cg", "fasttree", "hydragen", "hydragen_no_cg"):
             vs_flat = f"{a['avg_throughput'] / flat_tps:.2f}x"
 
         draft_str = f"{a['avg_draft_time']:.3f}" if a['avg_draft_time'] > 0 else "-"
@@ -469,11 +483,11 @@ def add_common_args(parser):
                         help="Quantization for draft model (e.g. fp8)")
     parser.add_argument("--kv-cache-dtype", default="auto",
                         help="KV cache dtype: auto, fp8_e5m2, fp8_e4m3 (default: auto)")
-    parser.add_argument("--only", choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree"],
+    parser.add_argument("--only", choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree", "hydragen", "hydragen_no_cg"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
     parser.add_argument("--skip", action="append", default=[],
-                        choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree"],
+                        choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree", "hydragen", "hydragen_no_cg"],
                         help="Skip one or more phases (repeatable, e.g. --skip cascade_no_cg --skip flat)")
     parser.add_argument("--time-spec", action="store_true",
                         help="Enable draft/verify timing (adds sync overhead)")
@@ -516,11 +530,11 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    phases = ["original", "flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
+    phases = ["original", "flat", "flat_no_cg", "hydragen_no_cg", "hydragen", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
     if args.only:
         phases = [args.only]
     elif args.skip_original:
-        phases = ["flat", "flat_no_cg", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
+        phases = ["flat", "flat_no_cg", "hydragen_no_cg", "hydragen", "cascade_per_step_no_cg", "cascade_per_step", "cascade_no_cg", "cascade", "fasttree"]
     if args.skip:
         phases = [p for p in phases if p not in args.skip]
 
