@@ -52,6 +52,9 @@ def create_engine(
     tp=1,
     context_length=None,
     mem_fraction_static=None,
+    quantization=None,
+    speculative_draft_model_quantization=None,
+    kv_cache_dtype="auto",
 ):
     """Create an sglang Engine with the given configuration."""
     from sglang.srt.entrypoints.engine import Engine
@@ -61,15 +64,21 @@ def create_engine(
         "tp_size": tp,
         "log_level": "warning",
         "enable_metrics": True,
+        "disable_piecewise_cuda_graph": True,
+        "kv_cache_dtype": kv_cache_dtype,
     }
     if context_length is not None:
         kwargs["context_length"] = context_length
     if mem_fraction_static is not None:
         kwargs["mem_fraction_static"] = mem_fraction_static
+    if quantization is not None:
+        kwargs["quantization"] = quantization
 
     if draft_model_path is not None:
         kwargs["speculative_algorithm"] = speculative_algorithm
         kwargs["speculative_draft_model_path"] = draft_model_path
+        if speculative_draft_model_quantization is not None:
+            kwargs["speculative_draft_model_quantization"] = speculative_draft_model_quantization
         if eagle_topk is not None or speculative_num_steps is not None:
             kwargs["speculative_eagle_topk"] = eagle_topk or 4
             kwargs["speculative_num_steps"] = speculative_num_steps or 10
@@ -199,6 +208,9 @@ def run_phase(args, phase, records):
         tp=args.tp,
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
+        quantization=getattr(args, "quantization", None),
+        speculative_draft_model_quantization=getattr(args, "speculative_draft_model_quantization", None),
+        kv_cache_dtype=getattr(args, "kv_cache_dtype", "auto"),
     )
 
     # Pre-tokenize all prompts and truncate to fit context_length - max_new_tokens
@@ -206,7 +218,7 @@ def run_phase(args, phase, records):
     _tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     max_prompt_tokens = None
     if args.context_length is not None:
-        max_prompt_tokens = args.context_length - args.max_new_tokens - 1
+        max_prompt_tokens = args.context_length - args.max_new_tokens - 64
 
     all_input_ids = []
     truncated = 0
@@ -451,6 +463,12 @@ def add_common_args(parser):
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Number of prompts to submit per engine.generate() call")
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--quantization", default=None,
+                        help="Quantization for target model (e.g. fp8, w8a8_fp8, modelopt_fp8)")
+    parser.add_argument("--speculative-draft-model-quantization", default=None,
+                        help="Quantization for draft model (e.g. fp8)")
+    parser.add_argument("--kv-cache-dtype", default="auto",
+                        help="KV cache dtype: auto, fp8_e5m2, fp8_e4m3 (default: auto)")
     parser.add_argument("--only", choices=["original", "flat", "flat_no_cg", "cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg", "fasttree"],
                         default=None, help="Run only one phase")
     parser.add_argument("--skip-original", action="store_true")
