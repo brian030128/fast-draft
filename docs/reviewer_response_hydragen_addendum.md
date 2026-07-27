@@ -56,6 +56,28 @@ workspace patching: Hydragen's algorithm with none of our additions. So
 **E2E**, STANDALONE, topk=5, depth=4, narrativeqa 50k, avg prompt 55 664 tokens,
 bs=2, H100, `--time-spec`, n=10.
 
+**At the paper's own configuration** — `eagle_topk=10`, `speculative_num_steps=7`,
+`num_draft_tokens=15`, bs=1, Llama-3.1-8B + Llama-3.2-1B, narrativeqa, H100 (job 282236).
+This is the config behind the H100/NarrativeQA row of Table~\ref{tab:speculative_decoding},
+and it reproduces that row (published: ours 1.24 s, SGLang 2.59 s), so Hydragen slots in
+as a fourth row directly:
+
+| phase                     | draft (s) | verify (s) | accept |
+|---------------------------|----------:|-----------:|-------:|
+| `paged` (SGLang default)  | 2.317     | 0.928      | 7.35   |
+| `hydragen` (CUDA graphs)  | **5.852** | 0.926      | 7.32   |
+| `cascade` (Fast Draft)    | **1.388** | 0.926      | 7.38   |
+
+Hydragen is **2.53× slower than SGLang** here — the slowest method in the table, below
+FastTree's 3.13 s — and our margin over it is **4.22×**, wider than the 3.33× at top-k=5.
+Verify time (0.926–0.928 s) and accept length (7.32–7.38) are constant, so the effect is
+isolated to the draft step. (The `tput` / `vs paged` columns in this run's summary are
+corrupted by an outlier sample and are not reported; draft/verify/accept are the metrics
+Table 1 uses and are self-consistent.)
+
+The runs below are at top-k=5 / depth=4, which does *not* match Table 1; they are kept
+because the kernel-level analysis was done at that shape.
+
 Llama-3.1-8B-Instruct + Llama-3.2-1B-Instruct (two independent runs, jobs 278505 and
 the node-local rerun — reproducible to ~1%):
 
@@ -86,10 +108,11 @@ What to take from this:
 1. **Verify time is identical across all three** (1.005–1.035 s) and accept length is
    unchanged (4.63–4.64). The port is correct, not a strawman, and the effect is isolated
    to the draft step — the same control §5 already relies on.
-2. **Hydragen's decomposition alone is a net loss end to end** (0.62×): draft time goes
-   *up*, 1.127 s → 2.837 s.
-3. **Fast Draft's draft step is 3.3× faster than the Hydragen port**, decomposition held
-   constant.
+2. **Hydragen's decomposition alone is a net loss end to end.** At the paper's config
+   draft time goes *up*, 2.317 s → 5.852 s (2.53× slower than the baseline it is meant
+   to improve).
+3. **Fast Draft's draft step is 4.22× faster than the Hydragen port** at the paper's
+   config (3.3× at top-k=5), decomposition held constant.
 
 ### Why — and it is the strongest answer we have to (d)(1)
 
