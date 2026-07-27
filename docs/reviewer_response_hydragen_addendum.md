@@ -86,21 +86,56 @@ What to take from this:
 1. **Verify time is identical across all three** (1.005–1.035 s) and accept length is
    unchanged (4.63–4.64). The port is correct, not a strawman, and the effect is isolated
    to the draft step — the same control §5 already relies on.
-2. **Hydragen's decomposition alone is a net loss end to end** (0.64×) *despite* being
-   4.63× faster than SGLang's paged draft attention at the kernel level. Draft time goes
-   *up*, 0.992 s → 2.379 s, because the draft loop re-plans both cascade levels on every
-   step of every decode iteration.
-3. **Fast Draft's draft step is 3.34× faster than the Hydragen port** (0.713 s vs
-   2.379 s), decomposition held constant.
+2. **Hydragen's decomposition alone is a net loss end to end** (0.62×): draft time goes
+   *up*, 1.127 s → 2.837 s.
+3. **Fast Draft's draft step is 3.3× faster than the Hydragen port**, decomposition held
+   constant.
 
-This strengthens §3 rather than contradicting it. §3's attribution is against
-*SGLang-default*, where the differential is the cascade kernel (1.68×) and plan-once is
-only 1.10×. Against a *Hydragen-style* baseline the weighting flips, because Hydragen
-plans two wrappers per step and has no plan-once: there, static planning is the dominant
-term. Both are true; state which baseline each attribution is relative to. The reviewer's
-"gains are from static-planning, not prefix-sharing" hypothesis is answered by the pair:
-vs SGLang-default it is the kernel; vs Hydragen it is the planning. Neither alone is the
-whole story, and saying so is more credible than picking one.
+### Why — and it is the strongest answer we have to (d)(1)
+
+The reviewer hypothesizes that our gains come from static planning rather than
+prefix-sharing. Measured at the draft model's real shape (32 q / 8 kv heads, head_dim 64,
+bs=2, topk=5, 16 layers × 4 steps), splitting one draft iteration into host work (which
+CUDA-graph replay must re-execute) and device work (which it captures):
+
+| prefix | backend  | host/iter | device/iter | host share |
+|--------|----------|----------:|------------:|-----------:|
+| 55 664 | hydragen | 4.69 ms   | 48.61 ms    | 10%        |
+| 55 664 | cascade  | 1.48 ms   | 10.44 ms    | 14%        |
+
+Hydragen is **device-bound**; planning is 10% of it. So static planning is *not* the
+explanation — which is a point in our favour, because the reviewer's alternative
+hypothesis is falsified on our own baseline rather than argued against.
+
+The real mechanism is bandwidth utilization. Per-token KV = 8 × 64 × 2 × 2 B = 2048 B;
+at prefix 55 664, bs=2:
+
+| variant  | KV read  | time     | achieved BW | speedup vs flat |
+|----------|---------:|---------:|------------:|----------------:|
+| flat     | 1.140 GB | 2.213 ms | 515 GB/s    | —               |
+| hydragen | 0.228 GB | 0.760 ms | 300 GB/s    | 2.91×           |
+| cascade  | 0.228 GB | 0.163 ms | 1399 GB/s   | 13.58×          |
+
+(Ceiling 2783 GB/s, measured by the gather microbenchmark on the same data, same GPU.)
+
+With topk=5, **pure deduplication caps the speedup over flat at 5×**. Hydragen reaches
+2.91× — *below* the bound: it reads exactly the reduced volume its decomposition promises,
+then moves it at 300 GB/s. Level 0 has only `num_seqs × topk` = 10 query rows against a
+55 664-token prefix, and a stock paged-prefill kernel parallelizes over queries and heads,
+so 10 rows cannot launch enough CTAs to saturate HBM. Fast Draft reaches 13.58× — *above*
+the bound, i.e. it reads the same reduced volume **and** partitions that read across CTAs.
+
+This is the regime distinction to put in the paper. Hydragen's target workload is large
+batches of independent completions of one prompt: hundreds of query rows, so occupancy is
+never the binding constraint. EAGLE draft decode is the opposite corner — very long shared
+prefix, almost no queries. **The decomposition is Hydragen's; making it run at draft
+decode's query-starved operating point is ours**, and that is the split-KV scheduler work
+already documented in `docs/cascade-vs-fasttree-analysis.md` (3-CTA/SM grid, `kv_limit`
+cap, Task-0/1 threshold fix).
+
+Consistent with §3, which attributes against *SGLang-default* (cascade kernel 1.68×,
+plan-once 1.10×) — same conclusion that the kernel, not the planning, carries the win.
+State which baseline each attribution is relative to.
 
 Recommended §4 rewrite: keep vLLM-EAGLE as the independent-*engine* row, and add
 Hydragen-in-SGLang as the independent-*method* row. The latter is the better controlled

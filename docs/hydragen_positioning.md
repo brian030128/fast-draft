@@ -172,17 +172,27 @@ End to end (Llama-3.1-8B + Llama-3.2-1B, STANDALONE, topk=5, depth=4, narrativeq
 
 The honest reading, which is also the strongest one:
 
-* **Most of the kernel-level win is Hydragen's, not ours.** Against the right baseline
-  our kernel advantage is ~2×, not the ~4.6× we get against SGLang. Report this.
-* **Hydragen's decomposition alone is a net loss end to end** (0.67× of the SGLang
-  baseline) even though it is 4.6× faster in the kernel, because the draft loop
-  re-plans both levels on all 3 draft steps of every decode iteration. CUDA graphs
-  recover part of it (0.55× → 0.67×) but cannot elide host-side planning.
-* **The gap between 0.67× and 1.23× is the contribution.** The two backends differ
-  only in per-step planning vs plan-once-and-patch (and fused vs separate merge), so
-  1.85× is a clean measurement of what the paper adds.
-* Accept length is unchanged (4.42 vs 4.45), so the Hydragen port is a correct
-  implementation, not a strawman.
+* **Hydragen's decomposition alone is a net loss end to end** (0.62–0.67× of the SGLang
+  baseline) even though it reads 5× less KV than flat, exactly as promised.
+* **The gap is the contribution**, and it is a kernel-efficiency gap, not a planning
+  gap. At the draft model's real shape (32 q / 8 kv heads, head_dim 64, bs=2, topk=5,
+  prefix 55 664) our fused kernel is **4.66× faster than the Hydragen port** —
+  0.163 ms vs 0.760 ms — while both read the same 0.228 GB.
+* **Measured, against the reviewer's own hypothesis:** per draft iteration Hydragen
+  spends 4.69 ms on host work and 48.61 ms on device work. It is device-bound, planning
+  is 10%, and CUDA graphs cannot help because there is little host time to remove. So
+  "the gains are static planning, not prefix-sharing" is falsified on our own baseline.
+* **The mechanism is occupancy.** With topk=5, pure deduplication caps the speedup over
+  flat at 5×. Hydragen gets 2.91× (300 GB/s) — *below* the bound, because level 0 has
+  only 10 query rows against a 55 664-token prefix and a stock paged-prefill kernel
+  parallelizes over queries and heads. We get 13.58× (1399 GB/s) — *above* the bound,
+  because we also split the shared-prefix read across CTAs. Ceiling on this GPU is
+  2783 GB/s.
+* Accept length is unchanged (3.93 vs 3.96; 4.42 vs 4.45 on the base models), so the
+  Hydragen port is a correct implementation, not a strawman.
+
+Earlier drafts of this file said the gap was per-step planning overhead. The host/device
+split above refutes that; keep the occupancy argument, which is both true and stronger.
 
 ## Suggested related-work sentence
 

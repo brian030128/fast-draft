@@ -167,17 +167,12 @@ baseline's 4.45 — the draft tree is the same tree. A broken attention implemen
 would collapse acceptance. This validates the port, so the timing numbers mean
 something.
 
-**2. Hydragen's decomposition, ported faithfully, is a net *loss* end-to-end** — 0.67×
-of SGLang's own paged draft attention, despite being 4.68× faster at the kernel level
-(see the table above). The kernel win is real and it is Hydragen's; it just does not
-survive contact with the draft loop, because the loop re-plans both cascade levels on
-every one of the 3 draft steps, every decode iteration. CUDA graphs recover part of it
-(0.55× → 0.67×) but cannot elide the planning, which happens on the host before replay.
+**2. Hydragen's decomposition, ported faithfully, is a net *loss* end-to-end** — 0.62×
+of SGLang's own paged draft attention. See the next section for why; it is **not**
+planning overhead, which is what I first assumed and the measurement refutes.
 
-**3. That gap is exactly what the paper's static planning closes.** Fast Draft is
-1.23× the baseline and **1.85× the Hydragen-paged port** (240.5 / 129.6) — with the
-decomposition math held constant between the two. The two backends differ only in
-per-step planning vs plan-once-and-patch, and the fused vs separate merge.
+**3. Fast Draft is 1.15–1.23× the baseline and ~1.85× the Hydragen port**, with the
+decomposition math held constant between the two.
 
 This is a much better answer to the reviewer than the previous framing. It concedes
 the primitive, adds the missing baseline, and shows the contribution is the part that
@@ -235,10 +230,56 @@ entire effect is in the draft step, which is the only thing any of these backend
 Hydragen's decomposition *increases* draft time 0.992 → 2.379 s even though its kernel is
 4.6× faster, and Fast Draft's draft step is **3.34× faster than the Hydragen port**.
 
-Note for attribution (and to keep this consistent with `ablation_report.md`): against
-*SGLang-default* the differential is mostly the cascade kernel (1.68×) with plan-once
-contributing only 1.10×. Against a *Hydragen-style* baseline the weighting flips, because
-Hydragen plans two wrappers per draft step and has no plan-once. Both are true; always say
+## Why Hydragen stays slow *with* CUDA graphs — measured, not assumed
+
+My first explanation was that per-step planning dominates and graphs cannot elide it.
+**That is wrong.** Splitting one draft iteration (16 layers × 4 steps, draft-model shape:
+32 q / 8 kv heads, head_dim 64, bs=2, topk=5) into host work (which graph replay must
+re-run) and device work (which it captures):
+
+| prefix | backend  | host/iter | device/iter | host share |
+|--------|----------|----------:|------------:|-----------:|
+| 16 384 | hydragen | 4.80 ms   | 16.11 ms    | 30%        |
+| 16 384 | cascade  | 1.35 ms   | 3.28 ms     | 41%        |
+| 55 664 | hydragen | 4.69 ms   | 48.61 ms    | 10%        |
+| 55 664 | cascade  | 1.48 ms   | 10.44 ms    | 14%        |
+
+Hydragen is **device-bound**, not host-bound. Planning is 10% of its cost at the real
+context length. CUDA graphs do not rescue it because there was never much host time to
+remove.
+
+**The actual reason is bandwidth utilization.** Per-token KV here is
+8 heads × 64 dim × 2 (K+V) × 2 B = 2048 B. At prefix 55 664, bs=2:
+
+| variant  | KV bytes read | time     | achieved BW | vs ceiling |
+|----------|--------------:|---------:|------------:|-----------:|
+| flat     | 1.140 GB      | 2.213 ms | 515 GB/s    | 19%        |
+| hydragen | 0.228 GB      | 0.760 ms | 300 GB/s    | 11%        |
+| cascade  | 0.228 GB      | 0.163 ms | 1399 GB/s   | 50%        |
+
+The ceiling is the 2783 GB/s the gather microbenchmark reaches on the same data on this
+GPU. Hydragen reads the *right* amount of memory — 5× less than flat, exactly as its
+decomposition promises — and then moves it at 300 GB/s.
+
+The reason is parallelism, and it is structural to the draft-decode regime. Level 0 has
+only `num_seqs × topk` = 10 query rows against a 55 664-token prefix. A stock paged
+prefill kernel parallelizes over queries and heads, so 10 rows cannot launch enough CTAs
+to saturate HBM. Hydragen's target workload — large batches of independent completions
+of one prompt — has hundreds of query rows, so this never bites there. EAGLE draft decode
+is the opposite corner: very long prefix, almost no queries.
+
+The clean way to see it: with topk=5, pure deduplication caps the speedup over flat at
+**5×**. Hydragen gets **2.91×** — *below* the dedup bound, because it gives back
+efficiency to under-parallelization. Fast Draft gets **13.58×** — *above* the dedup
+bound, so it is not just reading less, it is also partitioning the shared-prefix read
+across CTAs (the split-KV scheduler work in `docs/cascade-vs-fasttree-analysis.md`:
+3-CTA/SM grid, `kv_limit` cap, Task-0/1 threshold fix).
+
+So the honest attribution against a Hydragen baseline is: **the decomposition is theirs,
+the ability to run it at draft-decode's query-starved operating point is ours.**
+
+Note this is baseline-dependent and does not contradict `ablation_report.md`, which
+attributes vs *SGLang-default*: cascade kernel 1.68×, plan-once 1.10×. Always state
 which baseline an attribution is relative to.
 
 ## Open items
