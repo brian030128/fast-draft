@@ -24,6 +24,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 
 import torch
 
@@ -175,6 +176,24 @@ def check_merge_equivalence(num_tokens=4096, num_heads=8, head_dim=128):
 # ----------------------------------------------------------------------
 
 
+def _time_host(fn, warmup=5, repeat=20):
+    """Host-side wall time per call, without waiting on the GPU.
+
+    This is the part a CUDA graph cannot remove: graph replay elides kernel
+    *launches*, but any Python/C++ scheduling work still executes every
+    iteration.
+    """
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        fn()
+    elapsed = time.perf_counter() - t0
+    torch.cuda.synchronize()
+    return elapsed * 1e3 / repeat
+
+
 def bench_gather(num_seqs, topk, prefix_len, num_kv_heads, head_dim, num_layers, dtype):
     """Cost of building Hydragen's contiguous shared cache from a paged pool.
 
@@ -316,9 +335,21 @@ def bench_attention(num_seqs, topk, prefix_len, step_offset, num_qo_heads,
     t_cas = _time(lambda: cas.run(q, kv_data)[0])
     t_cas_plan = _time(plan_cas, warmup=5, repeat=20)
 
+    # Host-only wall time: what a CUDA graph replay still has to pay, because
+    # planning runs on the CPU and is not part of the captured graph.
+    h_hy_plan = _time_host(plan_ml)
+    h_cas_plan = _time_host(plan_cas)
+    # Launch/dispatch cost of one attention call, host side. Hydragen's run()
+    # issues three kernels (two paged prefills + merge_state_in_place); ours
+    # issues one fused kernel.
+    h_hy_run = _time_host(lambda: ml.run(q, kv_data))
+    h_cas_run = _time_host(lambda: cas.run(q, kv_data)[0])
+
     return dict(
         flat=t_flat, hydragen=t_hy, hydragen_plan=t_hy_plan,
         cascade=t_cas, cascade_plan=t_cas_plan,
+        host_hy_plan=h_hy_plan, host_cas_plan=h_cas_plan,
+        host_hy_run=h_hy_run, host_cas_run=h_cas_run,
     )
 
 
@@ -368,11 +399,13 @@ def main():
     print(f"  {'prefix':>8}  {'flat':>9}  {'hydragen':>9}  {'cascade':>9}  "
           f"{'hy plan':>9}  {'cas plan':>9}  {'hy/flat':>8}  {'cas/hy':>8}  {'gather/attn':>11}")
     print(f"  {'-'*8}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*11}")
+    attn_res = {}
     for pl in prefix_lens:
         r = bench_attention(
             args.num_seqs, args.topk, pl, args.step_offset,
             args.num_qo_heads, args.num_kv_heads, args.head_dim, dtype,
         )
+        attn_res[pl] = r
         ratio_hy = r["flat"] / r["hydragen"]
         ratio_cas = r["hydragen"] / r["cascade"]
         g_over_a = gather_ms[pl] / r["hydragen"]
@@ -384,6 +417,39 @@ def main():
     print("  cas/hy   = additional speedup from the fused two-level kernel")
     print("  gather/attn = cost of Hydragen's contiguous-cache requirement, "
           "relative to one attention call")
+
+    # --- 4. Why CUDA graphs do not rescue the Hydragen baseline ---------------
+    L, S = args.num_layers, args.num_draft_steps
+    print("\n=== 4. One draft iteration under CUDA graphs: host vs device ===")
+    print(f"  {L} layers x {S} draft steps. Hydragen re-plans every step "
+          f"({S} plans/iter); ours plans once and patches GPU buffers.")
+    print(f"  Host work runs on *every* graph replay -- it is not captured.")
+    print()
+    print(f"  {'prefix':>8}  {'':>10}  {'host/iter':>10}  {'device/iter':>12}  "
+          f"{'total':>10}  {'host share':>10}")
+    print(f"  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*12}  {'-'*10}  {'-'*10}")
+    for pl in prefix_lens:
+        r = attn_res[pl]
+        # Hydragen: S plans + L*S attention calls, each issuing 3 kernels.
+        hy_host = S * r["host_hy_plan"] + L * S * r["host_hy_run"]
+        hy_dev = L * S * r["hydragen"]
+        # Ours: one plan per iteration, L*S calls, each issuing 1 fused kernel.
+        cas_host = r["host_cas_plan"] + L * S * r["host_cas_run"]
+        cas_dev = L * S * r["cascade"]
+        for name, host, dev in (("hydragen", hy_host, hy_dev),
+                                ("cascade", cas_host, cas_dev)):
+            tot = max(host, dev)
+            print(f"  {pl if name == 'hydragen' else '':>8}  {name:>10}  "
+                  f"{host:>9.2f}ms  {dev:>11.2f}ms  {tot:>9.2f}ms  "
+                  f"{100*host/tot:>9.0f}%")
+        print(f"  {'':>8}  {'ratio':>10}  {hy_host/cas_host:>8.2f}x  "
+              f"{hy_dev/cas_dev:>10.2f}x  "
+              f"{max(hy_host,hy_dev)/max(cas_host,cas_dev):>8.2f}x")
+    print()
+    print("  'total' is max(host, device): with graphs the two overlap, so whichever")
+    print("  side dominates sets the floor. If Hydragen's host column exceeds its")
+    print("  device column, CUDA graphs cannot help it -- the cost is in planning,")
+    print("  which replay does not elide. That is what plan-once-and-patch removes.")
 
 
 if __name__ == "__main__":
