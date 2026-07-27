@@ -261,22 +261,68 @@ The ceiling is the 2783 GB/s the gather microbenchmark reaches on the same data 
 GPU. Hydragen reads the *right* amount of memory — 5× less than flat, exactly as its
 decomposition promises — and then moves it at 300 GB/s.
 
-The reason is parallelism, and it is structural to the draft-decode regime. Level 0 has
-only `num_seqs × topk` = 10 query rows against a 55 664-token prefix. A stock paged
-prefill kernel parallelizes over queries and heads, so 10 rows cannot launch enough CTAs
-to saturate HBM. Hydragen's target workload — large batches of independent completions
-of one prompt — has hundreds of query rows, so this never bites there. EAGLE draft decode
-is the opposite corner: very long prefix, almost no queries.
+### It is not a tuning artifact
 
-The clean way to see it: with topk=5, pure deduplication caps the speedup over flat at
-**5×**. Hydragen gets **2.91×** — *below* the dedup bound, because it gives back
-efficiency to under-parallelization. Fast Draft gets **13.58×** — *above* the dedup
-bound, so it is not just reading less, it is also partitioning the shared-prefix read
-across CTAs (the split-KV scheduler work in `docs/cascade-vs-fasttree-analysis.md`:
-3-CTA/SM grid, `kv_limit` cap, Task-0/1 threshold fix).
+The obvious reviewer question is whether the stock kernel can simply be configured
+better. FlashInfer's paged prefill exposes `fixed_split_size` and `disable_split_kv`,
+and split-KV is *already on by default*. Sweeping the entire range on Hydragen's
+level-0 pass (prefix 55 664, bs=2, topk=5):
 
-So the honest attribution against a Hydragen baseline is: **the decomposition is theirs,
-the ability to run it at draft-decode's query-starved operating point is ours.**
+| level-0 config              | level-0   | achieved BW |
+|-----------------------------|----------:|------------:|
+| default (split-kv auto)     | 0.749 ms  | 305 GB/s    |
+| `disable_split_kv=True`     | 0.741 ms  | 308 GB/s    |
+| `fixed_split_size` 256–16384 | 0.729 ms | 313 GB/s    |
+| **ours (fused)**            | **0.163 ms** | **1397 GB/s** |
+
+Under 3% variation across the whole knob range, and turning split-KV *off* changes
+nothing. Best-tuned Hydragen is still **4.59× slower**. "Just tune it" is dead.
+
+### It is also not occupancy — an earlier claim here, now retracted
+
+This file previously argued that level 0 is query-starved: 10 query rows cannot fill
+an H100. **That is wrong.** Sweeping query rows at *constant* level-0 KV volume:
+
+| top-k | q rows | hydragen  | hy BW    | ours      | ours BW   | ours/hy |
+|------:|-------:|----------:|---------:|----------:|----------:|--------:|
+| 1     | 2      | 0.747 ms  | 305 GB/s | 0.107 ms  | 2139 GB/s | 7.00×   |
+| 5     | 10     | 0.746 ms  | 306 GB/s | 0.161 ms  | 1413 GB/s | 4.62×   |
+| 10    | 20     | 0.729 ms  | 313 GB/s | 0.163 ms  | 1396 GB/s | 4.46×   |
+| 16    | 32     | 0.752 ms  | 303 GB/s | 0.168 ms  | 1355 GB/s | 4.47×   |
+| 32    | 64     | 0.760 ms  | 300 GB/s | 0.175 ms  | 1305 GB/s | 4.35×   |
+| 64    | 128    | 0.760 ms  | 300 GB/s | 0.341 ms  |  669 GB/s | 2.23×   |
+| 128   | 256    | 0.760 ms  | 300 GB/s | 0.655 ms  |  348 GB/s | 1.16×   |
+
+Hydragen is pinned at ~300–313 GB/s from 2 query rows to 256. Adding 128× more queries
+moves it not at all, so CTA count is not the constraint. Ours is fastest where there are
+*fewest* queries (2139 GB/s at top-k=1) and converges to Hydragen by top-k=128.
+
+### What the difference actually is
+
+Architectural, and visible in the source rather than inferred:
+
+* Hydragen / stock Cascade Inference compose levels **outside** the kernel — each level
+  separately planned and launched, split along KV internally, then combined by a third
+  `merge_state_in_place` launch. The two decompositions never inform one another.
+* Ours plans **one work queue spanning both levels and KV chunks**: each work item
+  carries `cascade_num_kv_chunks` / `cascade_kv_chunk_idx` next to its level's
+  `kv_start`/`kv_end`, and items are bucketed by *shape*, not by level (there is an
+  explicit case where "both levels land in Task 1"). A persistent kernel
+  (`cascade_persistent_attention`, `csrc/batch_attention.cu` — see `ablation_report.md`)
+  executes the queue in one launch, and a single reduction merges cross-level **and**
+  cross-chunk partials together.
+
+So the attribution against a Hydragen baseline is: **the decomposition is theirs; jointly
+scheduling it with the KV split, in one fused kernel with one merge, is ours** — and the
+benefit is specific to the few-query, long-shared-prefix corner that tree drafting
+occupies.
+
+**Not yet established:** that the measured speed is *caused* by the unification rather
+than by other differences in the kernel's memory pipeline. The margin being largest where
+there is least work per KV byte is consistent with amortizing fixed scheduling and launch
+cost, but that is suggestive, not proof. An nsys pass isolating reduction and launch
+overhead would settle it; until then report the architecture structurally and the speedup
+empirically, without a causal claim.
 
 Note this is baseline-dependent and does not contradict `ablation_report.md`, which
 attributes vs *SGLang-default*: cascade kernel 1.68×, plan-once 1.10×. Always state

@@ -120,18 +120,37 @@ at prefix 55 664, bs=2:
 
 With topk=5, **pure deduplication caps the speedup over flat at 5×**. Hydragen reaches
 2.91× — *below* the bound: it reads exactly the reduced volume its decomposition promises,
-then moves it at 300 GB/s. Level 0 has only `num_seqs × topk` = 10 query rows against a
-55 664-token prefix, and a stock paged-prefill kernel parallelizes over queries and heads,
-so 10 rows cannot launch enough CTAs to saturate HBM. Fast Draft reaches 13.58× — *above*
-the bound, i.e. it reads the same reduced volume **and** partitions that read across CTAs.
+then moves it at 300 GB/s. Fast Draft reaches 13.58×, *above* the bound, so it is not
+merely reading less.
 
-This is the regime distinction to put in the paper. Hydragen's target workload is large
-batches of independent completions of one prompt: hundreds of query rows, so occupancy is
-never the binding constraint. EAGLE draft decode is the opposite corner — very long shared
-prefix, almost no queries. **The decomposition is Hydragen's; making it run at draft
-decode's query-starved operating point is ours**, and that is the split-KV scheduler work
-already documented in `docs/cascade-vs-fasttree-analysis.md` (3-CTA/SM grid, `kv_limit`
-cap, Task-0/1 threshold fix).
+Two candidate explanations were tested and **both fail**, which is worth pre-empting
+because a reviewer will raise them:
+
+* **Tuning.** FlashInfer's paged prefill exposes `fixed_split_size` and
+  `disable_split_kv`, with split-KV already on by default. Sweeping 256–16384, and
+  disabling it outright, moves Hydragen's level 0 by under 3% (305 → 313 GB/s). Best
+  tuned, it is still 4.59× slower than ours on identical KV volume.
+* **Occupancy.** Sweeping query rows at *constant* level-0 KV volume, Hydragen is pinned
+  at ~300–313 GB/s from 2 rows to 256 — 128× more queries changes nothing, so CTA count
+  is not the constraint. (An earlier draft of this addendum claimed it was; retracted.)
+
+What survives is architectural. Hydragen and stock Cascade Inference compose levels
+*outside* the kernel: each level separately planned and launched, split along KV
+internally, then combined by a third `merge_state_in_place`. Ours plans **one work queue
+spanning both levels and KV chunks** — each item carries `cascade_num_kv_chunks` /
+`cascade_kv_chunk_idx` beside its level's `kv_start`/`kv_end`, bucketed by shape rather
+than by level — executed in a single persistent-kernel launch
+(`cascade_persistent_attention`, `csrc/batch_attention.cu`), with one reduction merging
+cross-level and cross-chunk partials together.
+
+The regime scope, measured: our margin over Hydragen is 7.00× at top-k=1, 4.4–4.6× across
+top-k 4–16 (where EAGLE runs), and 1.16× at top-k=128 — i.e. it converges exactly where
+Hydragen's own target workload lives (large batches of independent completions, many query
+rows). Stating this scope costs nothing and pre-empts the obvious probe.
+
+**Do not claim causality.** We have shown the architecture differs and that we are faster;
+we have *not* isolated that the fusion causes the speed rather than other memory-pipeline
+differences. An nsys pass on reduction and launch overhead would settle it.
 
 Consistent with §3, which attributes against *SGLang-default* (cascade kernel 1.68×,
 plan-once 1.10×) — same conclusion that the kernel, not the planning, carries the win.

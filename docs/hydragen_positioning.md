@@ -182,17 +182,26 @@ The honest reading, which is also the strongest one:
   spends 4.69 ms on host work and 48.61 ms on device work. It is device-bound, planning
   is 10%, and CUDA graphs cannot help because there is little host time to remove. So
   "the gains are static planning, not prefix-sharing" is falsified on our own baseline.
-* **The mechanism is occupancy.** With topk=5, pure deduplication caps the speedup over
-  flat at 5×. Hydragen gets 2.91× (300 GB/s) — *below* the bound, because level 0 has
-  only 10 query rows against a 55 664-token prefix and a stock paged-prefill kernel
-  parallelizes over queries and heads. We get 13.58× (1399 GB/s) — *above* the bound,
-  because we also split the shared-prefix read across CTAs. Ceiling on this GPU is
-  2783 GB/s.
+* **Not a tuning artifact.** FlashInfer's paged prefill exposes `fixed_split_size` and
+  `disable_split_kv` (split-KV is on by default). Sweeping 256–16384, and disabling it
+  entirely, moves Hydragen's level 0 by under 3% (305→313 GB/s); ours stays 4.59× faster.
+* **Not occupancy either** — an earlier version of this file said it was, wrongly.
+  Sweeping query rows at constant KV volume, Hydragen is pinned at ~300–313 GB/s from
+  2 rows to 256; 128× more queries changes nothing. Our margin is *largest* where queries
+  are fewest (7.00× at top-k=1, 2139 GB/s) and converges by top-k=128 (1.16×).
+* **The difference is architectural.** Hydragen composes levels outside the kernel:
+  separate plan and launch per level, split-KV internal to each, then a third merge
+  kernel. We plan one work queue spanning levels *and* KV chunks (bucketed by shape, so
+  both levels may share a task), execute it in one persistent-kernel launch, and merge
+  cross-level and cross-chunk partials in a single reduction.
 * Accept length is unchanged (3.93 vs 3.96; 4.42 vs 4.45 on the base models), so the
   Hydragen port is a correct implementation, not a strawman.
 
-Earlier drafts of this file said the gap was per-step planning overhead. The host/device
-split above refutes that; keep the occupancy argument, which is both true and stronger.
+Two explanations were tried here and both are retracted, so they do not resurface: the
+gap is *not* per-step planning overhead (the host/device split refutes it — Hydragen is
+device-bound, host is 10%), and it is *not* occupancy (the query-row sweep refutes it —
+bandwidth is flat from 2 to 256 query rows). What survives is the architectural
+difference, with the speedup reported empirically rather than causally attributed.
 
 ## Suggested related-work sentence
 
