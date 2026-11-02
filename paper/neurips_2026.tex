@@ -49,7 +49,7 @@
 
 
 \begin{abstract}
-Speculative decoding is an effective technique for accelerating autoregressive models in memory-bound regimes. Prior work has explored tree-based drafting to speculate multiple candidates at each step, improving verification acceptance rates. However, existing systems fail to fully realize the potential of tree-based drafting, leaving significant performance overhead. In this paper, we present FastDraft, a plug-and-play module that improves the efficiency of tree-based drafting in long-context speculative decoding. FastDraft exploits both the shared-prefix I/O pattern across draft branches and the constrained tree structure of speculative decoding, enabling specialized kernels that reduce draft-phase overhead while preserving compatibility with existing inference frameworks. FastDraft requires no modifications to the target model, draft model, or sampling logic. We implement FastDraft within SGLang and compare it against SGLang’s vanilla tree-based drafting backend, demonstrating substantially faster draft execution: up to 2.66× speedup in the draft phase and 1.77× higher throughput over SGLang under long-context settings.
+Speculative decoding is an effective technique for accelerating autoregressive models in memory-bound regimes. Prior work has explored tree-based drafting to speculate multiple candidates at each step, improving verification acceptance rates. However, existing systems fail to fully realize the potential of tree-based drafting, leaving significant performance overhead. In this paper, we present FastDraft, a plug-and-play module that improves the efficiency of tree-based drafting in long-context speculative decoding. FastDraft exploits both the shared-prefix I/O pattern across draft branches and the constrained tree structure of speculative decoding, enabling specialized kernels that reduce draft-phase overhead while preserving compatibility with existing inference frameworks. FastDraft requires no modifications to the target model, draft model, or sampling logic. We implement FastDraft within SGLang and compare it against SGLang’s vanilla tree-based drafting backend, demonstrating substantially faster draft execution: up to 2.92× speedup in the draft phase and 1.86× higher throughput over SGLang under long-context settings.
 \end{abstract}
 
 
@@ -71,7 +71,7 @@ In summary, this paper makes the following contributions:
 
     \item We make FastDraft compatible with CUDA Graphs by identifying and exploiting the static two-level structure of draft-tree attention. This enables GPU schedule planning to be performed once per draft phase and reused across draft steps, whereas existing approaches require repeated planning or CPU-side scheduling.
 
-    \item We integrate FastDraft into SGLang as a drop-in module and demonstrate substantial performance improvements on long-context speculative decoding workloads, achieving up to $2.66\times$ faster draft execution and up to $1.77\times$ higher throughput compared with the SGLang tree-based drafting baseline.
+    \item We integrate FastDraft into SGLang as a drop-in module and demonstrate substantial performance improvements on long-context speculative decoding workloads, achieving up to $2.92\times$ faster draft execution and up to $1.86\times$ higher throughput compared with the SGLang tree-based drafting baseline.
 \end{itemize}
 
 %{\color{red} List our contribution}
@@ -640,7 +640,7 @@ We implement FastDraft as a toggleable module on SGLang v0.5.9 and benchmark out
 As shown in Table~\ref{tab:speculative_decoding},
 FastDraft consistently delivers the best end-to-end performance in all evaluated settings, achieving the lowest draft latency and the highest speedup over autoregressive decoding, while leaving verification time and accept length unchanged relative to the SGLang baseline. These gains arise from treating CUDA-Graph compatibility as a first-class design constraint of the draft phase, rather than as a downstream engineering convenience. FastTree, on the other hand,  although is a prefix-aware kernel that reduces KV-cache traffic, it is consistently slower than the non-prefix-aware SGLang baseline, because its reliance on dynamic input shapes precludes CUDA Graph capture of the draft loop, while FastDraft resolves this by exploiting the two-level draft structure, which uses static planning: a single plan is reused across draft steps under CUDA Graph replay, eliminating per-step host-side scheduling.
 
-Table \ref{tab:batch-e2e} shows that FastDraft’s gains carry over to batched serving across different hardware settings. On NarrativeQA with a single RTX Pro 6000, FastDraft improves throughput over SGLang from 128.47 to 212.20 tokens/s at batch size 4 and from 131.42 to 226.16 tokens/s at batch size 8. On two A6000 GPUs, FastDraft improves throughput over SGLang from 103.97 to 183.55 tokens/s at batch size 4. Overall, FastDraft achieves up to 1.77$\times$ higher throughput over SGLang and up to 2.66$\times$ faster draft execution.
+Table \ref{tab:batch-e2e} shows that FastDraft’s gains carry over to batched serving across different hardware settings. On NarrativeQA with a single RTX Pro 6000, FastDraft improves throughput over SGLang from 128.47 to 212.20 tokens/s at batch size 4 and from 131.42 to 226.16 tokens/s at batch size 8. On two A6000 GPUs, FastDraft improves throughput over SGLang from 103.97 to 193.18 tokens/s at batch size 4. Overall, FastDraft achieves up to 1.86$\times$ higher throughput over SGLang and up to 2.92$\times$ faster draft execution.
 
 All these results demonstrate that FastDraft is a practical drop-in acceleration for tree-based speculative decoding, whose end-to-end benefits arise from the combination of a structure-aware formulation and an efficient execution strategy.
 
@@ -676,13 +676,13 @@ Ours           &                    & 2.94 & 2.33 & 226.16 & 2.09$\times$ & 2.51
 \midrule
 AR             & \multirow{3}{*}{4} & ---  & ---  & 96.65  & 1.00$\times$ & --- \\
 SGLang         &                    & 8.72 & 2.72 & 103.97 & 1.08$\times$ & 1.00$\times$ \\
-Ours           &                    & 3.27 & 2.75 & 183.55 & 1.90$\times$ & 2.66$\times$ \\
+Ours           &                    & 2.99 & 2.71 & 193.18 & 2.00$\times$ & 2.92$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Ablation Study}
-To quantify the contribution of each FastDraft component, we perform a step-by-step ablation starting from the CUDA-Graph-enabled SGLang draft backend. We first replace the SGLang draft backend with our specialized kernel, then enable CUDA Graph support for our kernel, and finally reuse the planning schedule across multiple draft steps. Figure~\ref{fig:ablation} reports the draft-phase speedup on NarrativeQA at batch size 4, using Llama-3.2-1B as the draft model and Llama-3.1-8B as the target model on two A6000.  Each component provides a consistent improvement, yielding speedups of 2.0$\times$, 1.17$\times$, and 1.14$\times$, respectively. Combined, these optimizations achieve an overall draft-phase speedup of 2.66$\times$.
+To quantify the contribution of each FastDraft component, we perform a step-by-step ablation starting from the CUDA-Graph-enabled SGLang draft backend. We first replace the SGLang draft backend with our specialized kernel, then enable CUDA Graph support for our kernel, and finally reuse the planning schedule across multiple draft steps. Figure~\ref{fig:ablation} reports the draft-phase speedup on NarrativeQA at batch size 4, using Llama-3.2-1B as the draft model and Llama-3.1-8B as the target model on two A6000.  Each component provides a consistent improvement, yielding speedups of 2.03$\times$, 1.27$\times$, and 1.13$\times$, respectively. Combined, these optimizations achieve an overall draft-phase speedup of 2.92$\times$.
 
 \begin{figure*}[h]
   \centering
@@ -697,7 +697,7 @@ To quantify the contribution of each FastDraft component, we perform a step-by-s
 
 \section{Conclusion}
 
-We presented FastDraft, a drop-in acceleration module for tree-based speculative decoding built on a single insight: the draft-phase attention workload is fundamentally two levels, a long verified prefix followed by a short branching suffix, and deserves to be treated as such rather than as a special case of general multi-level prefix hierarchies. We formalized this decomposition, and showed through a cost model together with empirical evaluation that, across practical draft-tree topologies, two levels are the preferred design point for existing tree-based drafting workloads, and designed a kernel that exploits shared prefix and retains full CUDA Graph compatibility. Integrated into SGLang, FastDraft delivers up to $2.66\times$ faster draft execution and meaningful end-to-end throughput gains, with consistent improvements across hardware (A6000 to H100), model sizes (4B to 70B), and long-context workloads from 10K to 100K tokens.
+We presented FastDraft, a drop-in acceleration module for tree-based speculative decoding built on a single insight: the draft-phase attention workload is fundamentally two levels, a long verified prefix followed by a short branching suffix, and deserves to be treated as such rather than as a special case of general multi-level prefix hierarchies. We formalized this decomposition, and showed through a cost model together with empirical evaluation that, across practical draft-tree topologies, two levels are the preferred design point for existing tree-based drafting workloads, and designed a kernel that exploits shared prefix and retains full CUDA Graph compatibility. Integrated into SGLang, FastDraft delivers up to $2.92\times$ faster draft execution and meaningful end-to-end throughput gains, with consistent improvements across hardware (A6000 to H100), model sizes (4B to 70B), and long-context workloads from 10K to 100K tokens.
 
 
 
