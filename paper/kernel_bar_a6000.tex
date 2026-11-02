@@ -1,0 +1,107 @@
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+    group style={
+        group size=1 by 4,
+        vertical sep=2.2cm,
+    },
+    ybar,
+    bar width=4pt,
+    width=\textwidth,
+    height=4.5cm,
+    ylabel={Speedup over Paged},
+    xlabel={Prefix Length},
+    symbolic x coords={1K,2K,4K,8K,16K,32K},
+    xtick=data,
+    ymin=0,
+    legend style={
+        at={(0.02,0.98)},
+        anchor=north west,
+        font=\scriptsize,
+        legend columns=4,
+        column sep=3pt,
+        /tikz/every even column/.append style={column sep=5pt},
+    },
+    legend image code/.code={
+        \draw[#1, draw=none] (0cm,-0.1cm) rectangle (0.25cm,0.1cm);
+    },
+    grid=major,
+    grid style={gray!20},
+    ymajorgrids=true,
+    xmajorgrids=false,
+    tick label style={font=\small},
+    label style={font=\small},
+    title style={font=\normalsize},
+    enlarge x limits=0.08,
+    extra y ticks={1},
+    extra y tick labels={},
+    extra y tick style={grid style={black, dashed, thin, opacity=0.5}},
+]
+
+% Row 1, Col 1: Llama-8B, topk=8
+\nextgroupplot[title={Llama-3-8B ($R\!=\!4$),\; Top-$k$ = 8}, ymax=4.5]
+\addplot[fill=blue!40, draw=blue!60] coordinates {
+    (1K,1.17) (2K,1.34) (4K,1.65) (8K,2.20) (16K,2.87) (32K,3.50)
+};
+\addplot[fill=orange!60, draw=orange!80] coordinates {
+    (1K,1.62) (2K,1.82) (4K,2.07) (8K,2.20) (16K,2.41) (32K,2.69)
+};
+\addplot[fill=green!50, draw=green!70] coordinates {
+    (1K,1.42) (2K,1.70) (4K,1.78) (8K,1.82) (16K,2.07) (32K,2.39)
+};
+\addplot[fill=red!70, draw=red!90] coordinates {
+    (1K,1.79) (2K,1.89) (4K,2.28) (8K,2.74) (16K,3.23) (32K,3.74)
+};
+\legend{FlashInfer, FastTree, DeFT, Ours}
+
+% Row 1, Col 2: Llama-8B, topk=16
+\nextgroupplot[title={Llama-3-8B ($R\!=\!4$),\; Top-$k$ = 16}, ymax=8.5]
+\addplot[fill=blue!40, draw=blue!60] coordinates {
+    (1K,1.55) (2K,2.20) (4K,3.00) (8K,4.30) (16K,5.78) (32K,6.98)
+};
+\addplot[fill=orange!60, draw=orange!80] coordinates {
+    (1K,2.22) (2K,2.50) (4K,3.35) (8K,3.83) (16K,4.33) (32K,4.74)
+};
+\addplot[fill=green!50, draw=green!70] coordinates {
+    (1K,2.04) (2K,2.81) (4K,2.81) (8K,3.04) (16K,3.43) (32K,3.74)
+};
+\addplot[fill=red!70, draw=red!90] coordinates {
+    (1K,2.43) (2K,2.68) (4K,4.17) (8K,5.40) (16K,6.60) (32K,7.50)
+};
+
+% Row 2, Col 1: Llama-70B, topk=8
+\nextgroupplot[title={Llama-3-70B ($R\!=\!8$),\; Top-$k$ = 8}, ymax=5.5]
+\addplot[fill=blue!40, draw=blue!60] coordinates {
+    (1K,1.15) (2K,1.38) (4K,1.91) (8K,2.37) (16K,2.97) (32K,4.19)
+};
+\addplot[fill=orange!60, draw=orange!80] coordinates {
+    (1K,1.58) (2K,1.67) (4K,1.98) (8K,1.97) (16K,2.42) (32K,3.23)
+};
+\addplot[fill=green!50, draw=green!70] coordinates {
+    (1K,1.36) (2K,1.57) (4K,2.06) (8K,2.01) (16K,2.30) (32K,2.95)
+};
+\addplot[fill=red!70, draw=red!90] coordinates {
+    (1K,1.81) (2K,1.96) (4K,2.40) (8K,2.80) (16K,3.33) (32K,4.43)
+};
+
+% Row 2, Col 2: Llama-70B, topk=16
+\nextgroupplot[title={Llama-3-70B ($R\!=\!8$),\; Top-$k$ = 16}, ymax=9.5]
+\addplot[fill=blue!40, draw=blue!60] coordinates {
+    (1K,1.52) (2K,2.49) (4K,3.33) (8K,4.50) (16K,6.19) (32K,7.70)
+};
+\addplot[fill=orange!60, draw=orange!80] coordinates {
+    (1K,2.07) (2K,2.18) (4K,3.11) (8K,3.35) (16K,3.98) (32K,4.70)
+};
+\addplot[fill=green!50, draw=green!70] coordinates {
+    (1K,1.93) (2K,2.74) (4K,3.27) (8K,3.29) (16K,3.79) (32K,3.64)
+};
+\addplot[fill=red!70, draw=red!90] coordinates {
+    (1K,2.34) (2K,2.43) (4K,3.86) (8K,5.48) (16K,6.93) (32K,8.23)
+};
+
+\end{groupplot}
+\end{tikzpicture}
+\caption{Speedup of tree attention kernels over paged attention across prefix lengths on RTX A6000 ($d\!=\!128$, FP16, suffix length 10). $R = h_{qo}/h_{kv}$ is the GQA ratio. Our fused two-level kernel achieves the highest speedup across nearly all configurations, with the advantage growing at longer prefixes and higher branching factors.}
+\label{fig:kernel-bars}
+\end{figure*}

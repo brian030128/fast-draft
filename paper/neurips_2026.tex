@@ -1,0 +1,735 @@
+\documentclass{article}
+
+
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{pgfplots} 
+\usepackage{float}
+\usepackage{svg}
+\usepgfplotslibrary{groupplots}
+% Note. For the workshop paper template, both \title{} and \workshoptitle{} are required, with the former indicating the paper title shown in the title and the latter indicating the workshop title displayed in the footnote. 
+\title{Efficient Tree Draft for Long-Context Speculative Decoding}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+
+\author{%
+  Brian J. Chan \\
+  National Yang Ming Chiao Tung University \\
+  \And
+  Ning-Chi Huang \\
+  National Yang Ming Chiao Tung University \\
+  \And
+  Kai-Chiang Wu \\
+  National Yang Ming Chiao Tung University \\
+}
+
+\begin{document}
+
+\maketitle
+
+
+\begin{abstract}
+Speculative decoding is an effective technique for accelerating autoregressive models in memory-bound regimes. Prior work has explored tree-based drafting to speculate multiple candidates at each step, improving verification acceptance rates. However, existing systems fail to fully realize the potential of tree-based drafting, leaving significant performance overhead. In this paper, we present FastDraft, a plug-and-play module that improves the efficiency of tree-based drafting in long-context speculative decoding. FastDraft exploits both the shared-prefix I/O pattern across draft branches and the constrained tree structure of speculative decoding, enabling specialized kernels that reduce draft-phase overhead while preserving compatibility with existing inference frameworks. FastDraft requires no modifications to the target model, draft model, or sampling logic. We implement FastDraft within SGLang and compare it against SGLang’s vanilla tree-based drafting backend, demonstrating substantially faster draft execution: up to 2.66× speedup in the draft phase and 1.77× higher throughput over SGLang under long-context settings.
+\end{abstract}
+
+
+
+\section{Introduction}
+Autoregressive language models generate one token at a time, requiring the full KV cache to be loaded into memory for every generated token. This results in a significant memory I/O bottleneck, particularly in long-context settings. 
+Speculative decoding~\cite{chen2023acceleratinglargelanguagemodel} has emerged as a promising solution that utilizes a lightweight draft model to propose several candidate tokens, which are then verified against the target model in a single forward pass thereby amortizing the cost of KV cache access. 
+This verification step guarantees the alignment with the target distribution, preserving generation quality. However, tokens that are rejected during verification lead to wasted computation, making the efficiency of the draft phase critical.
+%Speculative decoding~\cite{chen2023acceleratinglargelanguagemodel} has emerged as a promising solution by amortizing this cost across multiple tokens. In speculative decoding, a lightweight draft model proposes several candidate tokens, which are then verified against the target model in a single forward pass. This verification step guarantees the alignment with the target distribution, preserving generation quality, and reducing the amortized cost of KV cache access. However, tokens that are rejected during verification lead to wasted computation, making the efficiency of the draft phase critical.
+
+To improve token acceptance rates, recent work~\cite{Miao_2024, li2025eaglespeculativesamplingrequires, chen2025sequoiascalablerobusthardwareaware} extends speculative decoding from linear sequences to tree-based drafting, where multiple candidate tokens are proposed at each step. This forms a token tree that enables the verifier to evaluate multiple continuations simultaneously, increasing the expected number of accepted tokens per verification pass. However, existing serving systems such as SGLang \cite{10.5555/3737916.3739916} treat each query in the draft tree independently, loading the corresponding KV cache for every node. Because candidates share a large common prefix, this results in substantial redundant memory I/O that scales with tree width, undermining the efficiency gains of tree-based drafting.
+
+A natural way to reduce draft-phase memory traffic is to reuse the KV cache across shared prefixes using prior prefix-aware attention kernels~\cite{pan2025fasttree, yao2025deftdecodingflashtreeattention, cascade-inference}, which group queries with overlapping prefixes and compute attention jointly. However, in tree-based speculative decoding, the binding constraint is not merely kernel-level efficiency, but also compatibility with CUDA Graph replay. Existing kernels are designed for general multi-level prefix hierarchies, and this generality requires dynamic input structures whose shapes, grouping relationships, and scheduling metadata change as the tree evolves. As a result, they sacrifice the static execution pattern needed to avoid repeated CPU-side planning and launch overheads in the lightweight draft phase. 
+
+We observe that speculative draft trees have a much more constrained structure: a long verified prefix shared by all candidates, followed by a short branching suffix. Treating this two-level decomposition as a first-class primitive—and avoiding additional decomposition levels—makes the draft workload statically plannable, enabling a single scheduling plan per draft phase that can be reused across CUDA-Graph-replayed draft steps. Our cost-model analysis further shows that, for practical draft trees, additional intra-tree grouping levels do not amortize their merge and scheduling overheads. FastDraft realizes this design through a specialized persistent attention kernel integrated into SGLang, combining shared-prefix KV reuse with CUDA-Graph-compatible execution.
+In summary, this paper makes the following contributions:
+\begin{itemize}
+    \item We reveal that existing tree-based speculative decoding frameworks fail to fully exploit the shared-prefix structure of draft trees during the draft phase, resulting in redundant KV-cache memory traffic and avoidable execution overhead. We further show that existing prefix-aware attention kernels do not close this gap: their general multi-level designs reduce some KV-cache traffic, but sacrifice the static planning and CUDA-Graph compatibility required for efficient lightweight draft execution.
+
+    \item We make FastDraft compatible with CUDA Graphs by identifying and exploiting the static two-level structure of draft-tree attention. This enables GPU schedule planning to be performed once per draft phase and reused across draft steps, whereas existing approaches require repeated planning or CPU-side scheduling.
+
+    \item We integrate FastDraft into SGLang as a drop-in module and demonstrate substantial performance improvements on long-context speculative decoding workloads, achieving up to $2.66\times$ faster draft execution and up to $1.77\times$ higher throughput compared with the SGLang tree-based drafting baseline.
+\end{itemize}
+
+%{\color{red} List our contribution}
+
+% previous kernel do not exploit the characteristic of SD: long prefix + short draft tree
+% good: point out the research gap -> improve: paragraph organization
+\section{Methodology}
+To enhance the speed of tree-based drafting in long-context settings, we observe the characteristics of the draft phase and propose a system-level methodology. Our proposed specialized attention kernel reorders the attention computation by partitioning the decoding step of draft phase into two-level computation, which computes the shared prefix and then the branch draft tree, and finally merges them to obtain the attention output for each query. Therefore, our methodology avoids the heavy memory requirement of KV loads during draft tree generation. 
+
+First, we observe the structure of a draft tree and its attention computation to generate draft tokens. Consider a draft tree $\mathcal{T}$ with $N$ leaf
+queries $q_1, q_2, \ldots, q_N$. Each query $q_i$ corresponds to a unique
+root-to-leaf path through $\mathcal{T}$, visiting a sequence of $D$ internal
+nodes whose KV entries we denote $p_{i,1}, p_{i,2}, \ldots, p_{i,D}$.
+Following the PagedAttention framework \cite{kwon2023efficientmemorymanagementlarge} with page size being $1$, we treat each
+node's KV entry as a single \emph{page}, and use $p$ throughout to emphasize
+this page-level view.
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.88\textwidth]{figures/tree_based_SD.png}
+  \caption{Queries and KV entries in draft phase of tree-based speculative decoding.}
+  \label{fig:draft_tree_before_flatten}
+\end{figure}
+
+Figure~\ref{fig:draft_tree_before_flatten}(a) shows an example draft tree with
+three leaf queries, $q_1$, $q_2$, and $q_3$. The labels $p_{10}, p_{11}, \ldots, p_{15}$ are global
+page IDs identifying distinct KV entries in memory; sibling queries that
+share an ancestor reference the same page ID. For example, the tree encodes the following ancestor relationships: $q_1$ descends through
+$p_{10} \to p_{11} \to p_{13}$; $q_2$ through $p_{10} \to p_{12} \to p_{14}$;
+and $q_3$ through $p_{10} \to p_{12} \to p_{15}$. Here, the page $p_{10}$ lies on the
+shared prefix common to all three queries, while $p_{12}$ is shared only between
+$q_2$ and $q_3$.
+
+While the draft tree naturally exposes sharing across queries, existing
+implementations treat each query independently during attention computation as the na\"ive approach illustrated in Figure~\ref{fig:draft_tree_before_flatten}(b).
+Under the na\"ive approach, every query $q_i$ attends over its full path, loading
+all KV pages along $p_{1} \cdots p_{10}$, and $p_{i,1} \cdots p_{i,D}$ from memory. 
+Although pages $p_1, p_2, \ldots, p_{10}$ are on the shared prefix, these KV pages are loaded repeatedly for each query, leading to substantial redundancy.
+% This leads to substantial redundancy: pages on shared prefixes (e.g., $p_{10}$) are loaded repeatedly for each query, even though they are identical.
+
+\subsection{Two-Level Attention Computation}\label{sec:two-level_attn_comp}
+To reduce redundant KV loads during the draft phase of tree-based speculative decoding, we propose a two-level attention kernel. As illustrated in Figure~\ref{fig:draft_tree_before_flatten}(c), instead of computing the full attention over $\mathrm{KV}(q_i)$ for each query independently and loading its entire path of KV pages, we partition the KV cache into two parts, the shared prefix and the branching suffix. A shared prefix consists of the prompt and all previously accepted tokens. A branching suffix is the shallow tree of candidate continuations generated during the draft phase.
+This induces a natural two-level structure:
+\[
+\text{KV}(q_i) = 
+\underbrace{p_1, \dots, p_L}_{\text{shared prefix}}
+\;\; \Vert \;\;
+\underbrace{p_{i,1}, \dots, p_{i,D}}_{\text{branch-specific suffix}}.
+\]
+The attention computation can be decomposed into three steps: a grouped
+prefix attention, per-query draft path attention, and a merge operation.
+%{\color{red}a merge (merge is a verb.)}.
+ 
+\paragraph{Step 1: Grouped prefix attention.}
+First, we load the KV entries of the shared prefix (i.e., $K_{\mathrm{pfx}}, V_{\mathrm{pfx}}$) once and reuse them across all queries to compute attention scores.
+Because all $N$ queries are batched, $K_{\mathrm{pfx}}, V_{\mathrm{pfx}}$ are loaded from HBM only once, the memory traffic can be reduced from $N \cdot L$ to $L$.
+For each query, a partial output and log-sum-exp accumulator are produced:
+\begin{equation}
+  O_i^{(\mathrm{pfx})},\; \mathrm{lse}_i^{(\mathrm{pfx})}
+  = \mathrm{Attn}\!\bigl(q_i,\; K_{\mathrm{pfx}},\; V_{\mathrm{pfx}}\bigr)
+  \quad \text{for } i = 1, \ldots, N
+  \label{eq:pfx_output}
+\end{equation}
+
+\paragraph{Step 2: Per-query draft path attention.}
+Second, the remaining attention over the branch-specific suffix is computed for each query independently.
+Each query $q_i$ performs attention computation independently with its flattened draft path
+$K_{p_{i,1:D}}, V_{p_{i,1:D}}$.
+\begin{equation}
+  O_i^{(\mathrm{sfx})},\; \mathrm{lse}_i^{(\mathrm{sfx})}
+  = \mathrm{Attn}\!\bigl(q_i,\; K_{p_{i,1:D}},\; V_{p_{i,1:D}}\bigr)
+  \quad \text{for } i = 1, \ldots, N
+  \label{eq:draft_output}
+\end{equation}
+
+\paragraph{Step 3: Merge.}
+We merge the partial outputs of the above two steps to produce
+the same mathematical output as full attention with standard online softmax \cite{milakov2018onlinenormalizercalculationsoftmax}:
+\begin{equation}
+  m_i = \max\bigl(\mathrm{lse}_i^{(\mathrm{pfx})},\; \mathrm{lse}_i^{(\mathrm{sfx})}\bigr)
+  \label{eq:merge_max}
+\end{equation}
+\begin{equation}
+  O_i = \frac{
+    e^{\mathrm{lse}_i^{(\mathrm{pfx})} - m_i} \cdot O_i^{(\mathrm{pfx})}
+    + e^{\mathrm{lse}_i^{(\mathrm{sfx})} - m_i} \cdot O_i^{(\mathrm{sfx})}
+  }{
+    e^{\mathrm{lse}_i^{(\mathrm{pfx})} - m_i} + e^{\mathrm{lse}_i^{(\mathrm{sfx})} - m_i}
+  }
+  \label{eq:merge}
+\end{equation}
+for $i = 1, \ldots, N$, producing the final attention output for each query.
+
+ 
+\subsection{Analysis of Model Cost}
+\label{subsec:complexity}
+We compare the I/O complexity of our two-level approach against na\"ive per-query full attention.
+Both approaches compute mathematically identical attention over the same queries and keys, so the arithmetic cost (FLOPs)
+is unchanged; only the data movement pattern differs.
+We therefore focus on HBM bandwidth overheads, specifically the data movement associated with KV-cache loading and intermediate writing. 
+Besides, all costs are stated per KV head in units of one KV-token load.
+Under Grouped Query Attention (GQA) \cite{ainslie2023gqatraininggeneralizedmultiquery} with ratio $R = H_q/H_{kv}$ and per-head dimension~$d$, 
+loading one KV entry (one pair of KV vectors) for each token costs $2d$ elements of HBM traffic, amortized over $R$ query heads, and thus the unit cost per head is $c_{\mathrm{kv}} = 2d/R$.
+ 
+\paragraph{Na\"ive Approach.}
+Each of the $N$ queries independently compute attention score with the KV entries of its full context,
+including the repeatedly loaded prefix whose length is $L$ and the draft path whose length is $D$.
+Therefore, the memory I/O of a na\"ive approach is:
+\begin{equation}
+  C_{\mathrm{naive}} = N \cdot (L + D) \,,
+  \label{eq:naive_cost}
+\end{equation}
+
+ 
+\paragraph{Our Two-Level Approach.}
+The memory overhead of two-level approach is from all three steps mentioned in Section~\ref{sec:two-level_attn_comp}.
+Step~1 loads the KV cache of the shared prefix once and reuses it across all $N$
+queries.
+Step~2 loads each query's draft path independently. Both steps write their partial output ($d$ elements) to the HBM. Step~3 a merge kernel reads the partial output and produce the final output. This comes with an additional cost $\gamma$ for each query:
+\begin{equation}
+  \gamma \;=\; \frac{4d + 4}{2d/R}
+  \;=\; R\!\left(2 + \tfrac{2}{d}\right)
+  \;\approx\; 2R\,.
+  \label{eq:gamma}
+\end{equation}
+The extra HBM traffic per query
+per head is $4d + 4$ elements.
+Consider all three steps, and the total memory overhead of our two-level approach can be summarized as:
+\begin{equation}
+  C_{\mathrm{2L}} = L + N \cdot D + \gamma N\,.
+  \label{eq:twolevel_cost}
+\end{equation}
+ 
+\paragraph{Savings.} Memory overhead can be reduced by applying our two-level approach:
+\begin{equation}
+  C_{\mathrm{naive}} - C_{\mathrm{2L}}
+  = (N{-}1)\,L - \gamma N .
+  \label{eq:savings}
+\end{equation}
+which is positive whenever $L > \gamma N/(N{-}1)$.  For typical speculative
+decoding parameters ($L$ in the hundreds to thousands, $N \leq 16$,
+and $ 4 \leq \gamma \leq 20$), this condition is easily satisfied, and the savings
+scale linearly with the prefix length~$L$.
+
+
+\subsection{Why Two Levels Suffice for Practical Draft Trees}
+\label{sec:optimal_grouping}
+For existing practical draft tree generation, adding intermediate grouping levels to the draft tree (i.e., batching queries that share a common sub-path) confers no additional I/O reduction beyond the two-level decomposition. 
+% A natural question is whether inserting additional grouping levels within the draft tree---batching queries that share a common sub-path before splitting into per-query suffixes---can further reduce latency. We provide intuition for why the answer is no for practical draft-tree parameters, and confirm this empirically in Section~\ref{subsec:exp_twolevel}.
+This follows because each additional decomposition level introduces a merge overhead of at least $\gamma N$ (Eq.~\ref{eq:gamma}), while the most KV loads it can save is $(D-1)(N-1)$ in the best case that all queries share
+a common ancestor at the depth being $D-1$. 
+An extra level is therefore beneficial only when
+\[
+  D \;>\; \frac{\gamma N}{N - 1} + 1
+  \;\approx\; 2R + 1 \quad\text{for large } N\,.
+\]
+This threshold should be interpreted as an optimistic I/O-only lower bound on
+the crossover depth. It assumes that the only cost of adding a grouping level is
+the HBM traffic needed to materialize and merge an additional partial attention
+result. In practice, an additional level also introduces fixed scheduling cost,
+extra kernel work, and reduced GPU utilization because the newly created
+subproblems are short and fragmented.
+To capture these effects, let $\lambda$ denote the fixed per-level overhead
+converted into units of one KV-token load. Then an additional grouping level over a shared draft
+subpath of length $D-1$ is beneficial only if
+\[
+  (D-1)(N-1)
+  >
+  \gamma N + \lambda.
+\]
+Equivalently, the crossover depth becomes
+\[
+  D
+  >
+  1 +
+  \frac{\gamma N + \lambda}{N-1}.
+\]
+The equation suggests that adding grouping levels inside the draft tree is unlikely to be beneficial for practical speculative decoding workloads. Each additional level introduces fixed merging, scheduling, and kernel fragmentation overhead, while its only potential benefit is to reduce redundant KV traffic along shared prefixes in common sub-paths. This benefit is limited by the depth of the draft tree. In current systems, the branching suffix is short, so there are too few draft tokens over which intermediate prefix sharing can amortize the extra overhead.
+
+Under the assumption that the current draft trees are short, the two-level decomposition is the preferred design point. It captures the dominant source of reuse, that is, the long verified prefix shared by all draft queries, while avoiding the additional costs introduced by finer-grained multi-level grouping. Additional levels may only become beneficial for substantially deeper draft trees, where intermediate shared prefixes are long enough to offset their merge and scheduling overheads. We validate this assumption empirically in Section~\ref{subsec:exp_twolevel}.
+
+% \subsection{Kernel}
+% \label{sec:kernel}
+% Prior prefix-IO-aware kernel \cite{ye2025flashinferefficientcustomizableattention} launches separate kernels for each shared prefix level, while this approach may work on multi-level attention problems, this decomposition introduces an utilization bottleneck when applied to the two-level draft-tree workload: the prefix phase is memory-bandwidth-bound and cannot fully occupy the GPU, while the many independent suffix problems are each too small to do so either. We propose a fused kernel that exploits this complementarity, by allocating only the resources necessary for the prefix computation, the remaining capacity is devoted to suffix workloads, which contend minimally with the memory-bound prefix for compute. This co-scheduling strategy achieves higher hardware utilization than prior kernels (Section~\ref{subsec:kernel_bench}).
+% \paragraph{CUDA Graph Compatibility}
+% Because the draft model is small, kernel launch overhead dominates execution time, making CUDA graph capture essential for efficient tree drafting.
+% However, existing tree-aware attention kernels such as FastTree~\cite{pan2025fasttree} and DeFT~\cite{yao2025deftdecodingflashtreeattention} are incompatible with CUDA graphs.
+% Both systems use tree-topology-dependent kernel launch parameters: FastTree dispatches its Stage-1 kernel on a grid of $(\texttt{node\_num}, H_{kv})$ where $\texttt{node\_num}$ varies with the tree structure, and DeFT similarly varies its grid over the number of KV nodes and reallocates intermediate buffers each iteration as the tree is pruned and expanded.
+% CUDA graphs require all kernel launch parameters and tensor shapes to be fixed at capture time, so these data-dependent shapes cannot be captured.
+
+% \paragraph{Plan/Run Separation.}
+% Our approach is inspired by  FlashInfer, which separates a CPU-side \texttt{plan()} phase from the GPU-side \texttt{run()} kernel.
+% The \texttt{run()} kernel itself has fixed tensor shapes and is CUDA graph compatible; the difficulty is that \texttt{plan()} must be called before each \texttt{run()} to populate the workspace buffers with the current step's KV indices. 
+% The original \texttt{plan()} transfers GPU tensors to the CPU and calls \texttt{torch.cuda.synchronize()} before invoking a C++ scheduler, so it cannot be placed inside a captured graph.
+% A naive approach would call \texttt{plan()} before every graph replay, but the CPU--GPU synchronization it introduces serializes the pipeline and negates the benefit of graph capture.
+
+% \paragraph{GPU-Side Index Generation.}
+% We solve this by replacing the CPU scheduling logic with two Triton kernels that regenerate the Level-1 (shared prefix) and Level-2 (per-branch suffix) KV index arrays entirely on the GPU, eliminating the CPU--GPU synchronization that made the original \texttt{plan()} incompatible with graph capture. At capture time, \texttt{plan()} is called once to initialize the workspace and the \texttt{run()} kernel is recorded into the graph; at replay time, only the lightweight Triton regeneration runs before the captured graph. The KV index buffer is pre-allocated to worst-case size at initialization, so no dynamic allocation occurs during inference. We bound the workspace allocation to 128 MiB, which is sufficient for all configurations evaluated in our experiments, the memory overhead is negligible compared with the 49{,}140 MiB of device memory available on the evaluated GPUs. 
+
+% \paragraph{Plan Reuse via Shape Invariance.}
+% FlashInfer's \texttt{plan()} computes scheduling metadata---SM work distribution, KV chunking, and merge indices---from \emph{shapes} alone; it does not depend on KV values or on scalar sequence lengths. Under our two-level schema, every draft step presents the same shapes, one prefix region per request, one suffix region per branch, with fixed \texttt{qo\_indptr} and \texttt{kv\_indptr} layouts. Only the Level-2 length scalar and the contents of \texttt{kv\_indices} change as the suffix grows by one token per step. A multi-level decomposition that assigns one level per branching layer loses this invariance---step $i$ would emit $i{+}1$ levels and a correspondingly larger plan output---so \texttt{plan()} would have to re-run every step.
+
+% We therefore run \texttt{plan()} once at maximum depth and reuse its metadata across all $D{-}1$ draft steps. Because CUDA Graphs bake pointers at capture, a single mutable workspace would alias across steps at replay; we instead allocate $D{-}1$ wrappers with disjoint workspaces, copy the planned metadata into each, and scatter-write per-step lengths. The captured prologue is then two Triton kernels (index regeneration) and $D{-}1$ scatters---no \texttt{plan()} call and no host--device synchronization.
+\subsection{Two-Level Attention Kernel for Tree-Based Draft Decoding}
+\label{sec:kernel}
+
+\paragraph{Two-Level Persistent Kernel.}
+FastDraft implements a specialized \emph{persistent} attention kernel for the two-level structure of tree decoding during the draft phase. At each draft step, the attention problem can be naturally decomposed into a long shared prefix and multiple branch-specific suffixes. These two components have complementary performance characteristics, where the prefix computation is dominated by HBM traffic, while the suffix computations are small, independent, and expose additional parallelism. Rather than launching separate kernels for the prefix and suffix parts, FastDraft processes them within a single persistent kernel followed by a merge kernel. The shared prefix is streamed once and reused across all branches, while the remaining GPU resources are used to process the suffix workloads concurrently. This design preserves the I/O benefit of prefix sharing and improves hardware utilization by combining the memory-bound prefix work with the smaller suffix computations in one execution path.
+
+\paragraph{CUDA Graph Replay for Draft Loop.}
+CUDA Graphs are important in the draft phase of speculative decoding because the draft model is small, so CPU launch and scheduling overhead can become a noticeable fraction of draft latency. FastDraft therefore treats CUDA Graph replay as a first-class part of the kernel design. Rather than merely capturing an individual attention call, FastDraft makes the repeated multi-step draft loop replayable without CPU-side scheduling in the critical path.
+
+We build on the standard \texttt{plan()}--\texttt{run()} separation used by modern attention systems. The challenge is that, in a na\"ive implementation, \texttt{plan()} would still need to run before every draft step in order to rebuild the scheduling metadata for the current KV layout, causing CPU synchronization and disrupting the GPU execution flow. FastDraft avoids this by exploiting the shape invariance described in the next paragraph: the two-level draft-tree structure allows FastDraft to plan only once for a draft phase and reuse the same plan across subsequent draft steps.
+
+During CUDA-Graph replay, FastDraft keeps the scheduling metadata produced by \texttt{plan()} fixed and updates only the per-step dynamic state on the GPU. The shared-prefix index buffers are constructed once and reused throughout replay, while the active suffix lengths and suffix KV indices are patched in preallocated maximum-depth buffers as the draft tree grows. Each captured step uses a stable workspace to avoid pointer aliasing inside the graph. As a result, the replayed draft loop consists only of GPU-side suffix-index patching, lightweight workspace updates, and persistent attention execution, with no repeated \texttt{plan()} call, host-side scheduler invocation, or host--device synchronization on the critical path.
+
+\paragraph{Why Two Levels Enable Reuse.}
+The key observation is that the two-level formulation produces the same planning structure in every draft step. In each step, exactly one shared-prefix part and exactly one suffix part are used for each branch. Thus, the mapping from the tree to the attention problem is fixed: branch $i$ always maps to suffix part $i$. As the draft tree grows, the active suffix of each branch becomes longer, but the number of parts, their ordering, and their buffer layout remain unchanged. All planning metadata can therefore be allocated once for the maximum draft depth and reused across steps. The per-step dynamic state is limited to the active suffix lengths and the corresponding suffix KV indices, both of which are updated in preallocated buffers as the draft tree grows.
+
+This static-metadata property is specific to the two-level formulation. In a general multi-level tree decomposition, the attention problem is partitioned according to the internal tree topology. The number of parts, their sizes, and their grouping relationships all depend on the current branch structure of the tree. As the tree expands from step to step, the decomposition itself changes, so the planning shape is dynamic in the multi-level prefix-sharing approach. In contrast, by decomposing the draft tree into one shared-prefix region and one branch-specific suffix region per branch, FastDraft keeps both the decomposition and the associated scheduling metadata static even though the active draft-tree depth evolves, making plan reuse possible.
+
+% \section{Methodology}
+% \label{sec:two_level_kernel}
+% %{\color{red}Is this section the ‵Methodology'? Besides, showing the purpose of our method in the beginning of this paragraph can make it easier to understand.}
+
+% In this section, to exploit the shared prefix structure inherent in token trees, we propose a two-level decomposition \textcolor{red}{method} for the attention computation of draft tree generation. Besides, we analyze its memory traffic complexity and show that, across the range of tree topologies arising in practical speculative decoding, additional decomposition levels introduce merge overhead that outweighs their KV-sharing benefit. Accordingly, our analysis and experiments indicate that two levels are the preferred design point for existing tree-based drafting workloads.
+
+% In speculative decoding, the KV cache at any decoding step can be partitioned at the first branching point of the draft tree $\mathcal{T}$ into two structurally distinct regions: a \emph{shared prefix} of length $\mathcal{L}$, comprising the verified tokens accepted by the target model along with any draft tokens on the common trunk before the first branch, and a \emph{branching suffix}, whose nodes represent the diverging candidate continuations beyond that point. We exploit this partition by decomposing the attention computation into exactly two levels---one over the shared prefix and one over the branching suffixes.
+
+
+% \subsection{Flattening the Draft Tree}
+% \label{subsec:flattening}
+
+% Our goal is to compute attention for all $N$ draft queries in a way that
+% loads the shared prefix KV cache from HBM only once, rather than $N$ times.
+% To set this up, we organize each query's KV context into two parts: a prefix
+% common to all queries, and a suffix private to each query. We obtain this
+% view by \emph{flattening} the draft tree---treating each query's
+% root-to-leaf path as an independent linear sequence of pages. Pages shared
+% among sibling queries in $\mathcal{T}$ simply appear in multiple per-query
+% sequences; the underlying KV cache is untouched.
+
+% We now make this precise. Consider a draft tree $\mathcal{T}$ with $N$ leaf
+% queries $q_1, q_2, \ldots, q_N$. Each query $q_i$ corresponds to a unique
+% root-to-leaf path through $\mathcal{T}$, visiting a sequence of $D_i$ internal
+% nodes whose KV entries we denote $p_{i,1}, p_{i,2}, \ldots, p_{i,D_i}$.
+% Following the paged-attention framework with page size $1$, we treat each
+% node's KV entry as a single \emph{page}, and use $p$ throughout to emphasize
+% this page-level view.
+
+% Figure~\ref{fig:draft_tree_before_flatten} shows an example draft tree with
+% three leaf queries. The labels $p_{10}, p_{11}, \ldots, p_{15}$ are global
+% page IDs identifying distinct KV entries in memory; sibling queries that
+% share an ancestor reference the same page ID.
+% \begin{figure}[H]
+%   \centering
+%   \includegraphics[width=0.7\textwidth]{draft_tree_before_flatten.png}
+%   \caption{An example draft tree. Queries $q_2$ and $q_3$ share the interior
+%   page $p_{12}$, and all three queries share $p_{10}$.}
+%   \label{fig:draft_tree_before_flatten}
+% \end{figure}
+% The tree encodes the following ancestor relationships: $q_1$ descends through
+% $p_{10} \to p_{11} \to p_{13}$; $q_2$ through $p_{10} \to p_{12} \to p_{14}$;
+% and $q_3$ through $p_{10} \to p_{12} \to p_{15}$. Page $p_{10}$ lies on the
+% shared prefix common to all queries, while $p_{12}$ is shared only between
+% $q_2$ and $q_3$.
+
+% Figure~\ref{fig:draft_tree_after_flatten} shows the flattened view. Pages
+% shared among siblings in $\mathcal{T}$ now appear in multiple per-query
+% sequences---for instance, $p_{12}$ appears in both $q_2$'s and $q_3$'s paths.
+% Only page indices are replicated; the underlying KV tensors remain stored
+% exactly once, and no KV data is copied or rewritten in memory.
+% \begin{figure}[H]
+%   \centering
+%   \includegraphics[width=0.7\textwidth]{draft_tree_after_flatten.png}
+%   \caption{The flattened view of the draft tree in
+%   Figure~\ref{fig:draft_tree_before_flatten}. Each query is associated with
+%   its own linear sequence of page IDs. Page $p_{12}$ appears in both $q_2$'s
+%   and $q_3$'s sequences but still refers to a single KV entry in memory.}
+%   \label{fig:draft_tree_after_flatten}
+% \end{figure}
+% After flattening, the full KV context of query $q_i$ is the concatenation of
+% the shared prefix (of length $\mathcal{L}$) and its flattened draft path:
+% \begin{equation}
+%   \mathrm{KV}(q_i)
+%   = \bigl[\,\underbrace{p_1, p_2, \ldots, p_{\mathcal{L}}}_{\text{shared prefix}},\;
+%     \underbrace{p_{i,1}, p_{i,2}, \ldots, p_{i,D_i}}_{\text{flattened draft path of } q_i}\,\bigr].
+%   \label{eq:kv_concat}
+% \end{equation}
+% The shared prefix is common to all $N$ queries, while each flattened draft
+% path is specific to its query. This two-level partition---shared prefix plus
+% per-query suffix---is exactly the structure consumed by the attention
+% decomposition described next.
+
+% \subsection{Two-Level Attention Computation}
+% \label{subsec:two_level_compute}
+ 
+% Rather than computing each query's full attention over $\mathrm{KV}(q_i)$
+% independently, we decompose the computation into three steps: a grouped
+% prefix attention, per-query draft path attention, and a merge operation.
+% %{\color{red}a merge (merge is a verb.)}.
+ 
+% \paragraph{Step 1: Grouped prefix attention.}
+% All $N$ queries attend over the verified prefix
+% $K_{\mathrm{pfx}}, V_{\mathrm{pfx}} \in \mathbb{R}^{{\color{red}L \times d}}$. The $N$ queries are aggregated so that the
+% prefix KV cache is loaded from HBM once and reused across all queries,
+% reducing the memory traffic from $N \cdot L$ to $L$.
+% Each query $q_i$ is masked from all other queries' KV, ensuring that its output
+% depends only on the prefix tokens. This produces, for each query, a partial
+% output and log-sum-exp accumulator:
+% \begin{equation}
+%   O_i^{(\mathrm{pfx})},\; \mathrm{lse}_i^{(\mathrm{pfx})}
+%   = \mathrm{Attn}\!\bigl(q_i,\; K_{\mathrm{pfx}},\; V_{\mathrm{pfx}}\bigr)
+%   \quad \text{for } i = 1, \ldots, N
+%   \label{eq:pfx_output}
+% \end{equation}
+
+% \paragraph{Step 2: Per-query draft path attention.}
+% Each query $q_i$ attends independently over its flattened draft path
+% $K_{p_{i,1:D_i}}, V_{p_{i,1:D_i}}$.
+% \begin{equation}
+%   O_i^{(\mathrm{draft})},\; \mathrm{lse}_i^{(\mathrm{draft})}
+%   = \mathrm{Attn}\!\bigl(q_i,\; K_{p_{i,1:D_i}},\; V_{p_{i,1:D_i}}\bigr)
+%   \quad \text{for } i = 1, \ldots, N
+%   \label{eq:draft_output}
+% \end{equation}
+
+% \paragraph{Step 3: Merge.}
+% The partial outputs are combined using the standard online softmax \cite{milakov2018onlinenormalizercalculationsoftmax} merging
+% procedure:
+% \begin{equation}
+%   O_i = \frac{
+%     e^{\mathrm{lse}_i^{(\mathrm{pfx})}} \cdot O_i^{(\mathrm{pfx})}
+%     + e^{\mathrm{lse}_i^{(\mathrm{draft})}} \cdot O_i^{(\mathrm{draft})}
+%   }{
+%     e^{\mathrm{lse}_i^{(\mathrm{pfx})}} + e^{\mathrm{lse}_i^{(\mathrm{draft})}}
+%   }
+%   \label{eq:merge}
+% \end{equation}
+% for $i = 1, \ldots, N$, producing the final attention output for each query.
+
+ 
+% \subsection{Complexity Analysis}
+% \label{subsec:complexity}
+% We compare the memory I/O costs of the two-level approach against na\"ive
+% per-query full attention.  Both approaches compute mathematically identical
+% attention over the same queries and keys, so the arithmetic cost (FLOPs)
+% is unchanged; only the data movement pattern differs.  We therefore focus
+% on HBM bandwidth---specifically KV-cache loads and intermediate
+% writes---as justified in the cost model discussion below.
+ 
+% All costs are stated per KV head in units of one KV-token load.  Under
+% Grouped Query Attention (GQA) with ratio $R = n_q/n_{kv}$ and per-head
+% dimension~$d$, loading one KV token (one key vector plus one value vector)
+% costs $2d$ elements of HBM traffic, amortized over $R$ query heads; the
+% unit cost per head is $c_{\mathrm{kv}} = 2d/R$.
+ 
+% \paragraph{Na\"ive approach.}
+% Each of the $N$ queries independently attends over its full context of
+% length $L + D_i$.  The verified prefix KV cache of size $L$ is loaded $N$
+% times.  The total cost is:
+% \begin{equation}
+%   C_{\mathrm{naive}} = N \cdot (L + \bar{D}) \,,
+%   \label{eq:naive_cost}
+% \end{equation}
+% where $\bar{D} = \frac{1}{N}\sum_{i=1}^N D_i$ is the average draft path
+% length (all in units of $c_{\mathrm{kv}}$).
+ 
+% \paragraph{Two-level approach.}
+% Stage~1 loads the verified prefix KV once and reuses it across all $N$
+% queries.  Stage~2 loads each query's draft path independently.  Because the
+% two stages run as separate kernels, each query incurs a \emph{merge cost}
+% $\gamma$: Stage~1 writes a partial output ($d$ elements) and a log-sum-exp
+% scalar to HBM; the merge kernel reads both partial outputs and both
+% scalars.  The merge kernel's final output write is not incremental (a fused
+% single-pass kernel would produce it too).  The extra HBM traffic per query
+% per head is $4d + 4$ elements, giving:
+% \begin{equation}
+%   \gamma \;=\; \frac{4d + 4}{2d/R}
+%   \;=\; R\!\left(2 + \tfrac{2}{d}\right)
+%   \;\approx\; 2R\,.
+%   \label{eq:gamma}
+% \end{equation}
+% The total two-level cost is:
+% \begin{equation}
+%   C_{\mathrm{2L}} = L + N \cdot \bar{D} + \gamma N\,.
+%   \label{eq:twolevel_cost}
+% \end{equation}
+ 
+% \paragraph{Savings.}
+% \begin{equation}
+%   C_{\mathrm{naive}} - C_{\mathrm{2L}}
+%   = (N{-}1)\,L - \gamma N
+%   = \bigl[(N{-}1)\,L - \gamma N\bigr]\,,
+%   \label{eq:savings}
+% \end{equation}
+% which is positive whenever $L > \gamma N/(N{-}1)$.  For typical speculative
+% decoding parameters ($L$ in the hundreds to thousands, $N \leq 16$,
+% $ 4 \leq \gamma \leq 20$), this condition is easily satisfied, and the savings
+% scale linearly with the prefix length~$L$.
+% Table~\ref{tab:gamma} lists $\gamma$ for representative architectures:
+
+% \begin{table}[h]
+% \centering
+% \caption{Merge constant $\gamma = R(2 + 2/d)$ for common architectures.}
+% \small
+% \renewcommand{\arraystretch}{1.15}
+% \begin{tabular}{lccccr}
+% \toprule
+% Model & $n_q$ & $n_{kv}$ & $R$ & $d$ & $\gamma$ \\
+% \midrule
+% Llama-3-8B          & 32  & 8  & 4  & 128 & 8.06 \\
+% Llama-3-70B         & 64  & 8  & 8  & 128 & 16.12 \\
+% Qwen-3.5-27B        & 24  & 4  & 6  & 128 & 12.09 \\
+% \bottomrule
+% \end{tabular}
+% \label{tab:gamma}
+% \end{table}
+
+% \subsection{Two Levels Suffice for Practical Draft Trees}
+% \label{sec:optimal_grouping}
+% A natural question is whether inserting additional grouping levels within the
+% draft tree---batching queries that share a common sub-path before splitting
+% into per-query suffixes---can further reduce latency. We provide intuition
+% for why the answer is no for practical draft-tree parameters, and confirm
+% this empirically in Section~\ref{subsec:exp_twolevel}.
+% Each additional decomposition level introduces a merge overhead of at least
+% $\gamma N$ (Eq.~\ref{eq:gamma}), while the most it can save is
+% $(D-1)(N-1)$ redundant KV loads in the best case---when all queries share
+% a common ancestor at depth $D-1$. An extra level is therefore beneficial
+% only when
+% \[
+%   D \;>\; \frac{\gamma N}{N - 1} + 1
+%   \;\approx\; 2R + 1 \quad\text{for large } N\,.
+% \]
+% For GQA architectures with $R \geq 4$ (Llama-3, Mistral, Qwen-3.5, etc.),
+% this gives a lower-bound threshold of $D > 9$. In practice the true
+% threshold is larger: $\gamma$ captures only the HBM traffic of the extra
+% partial-output and log-sum-exp transfers, and omits the kernel 
+% scheduling overhead, and reduced per-kernel occupancy that an additional
+% decomposition level incurs. Our measurements (Section~\ref{subsec:exp_twolevel})
+% show that these effects push the crossover well beyond the depths used in
+% current draft trees ($D \leq 10$), so the merge overhead of additional
+% levels outweighs the KV-sharing benefit across the operating range we
+% consider.
+% We examine this prediction empirically in
+% Section~\ref{subsec:exp_twolevel}, sweeping over tree widths
+% $W \in \{10, \ldots, 16\}$, depths $D \in \{4, \ldots, 16\}$, and three
+% draft-tree distributions (best case, worst case, and beam search). The two-level scheme is faster in every tested configuration, supporting the conclusion that, for the draft-tree topologies used in current speculative decoding systems, two levels are the preferred design point
+
+
+
+% \subsection{Kernel}
+% \label{sec:kernel}
+% Prior prefix-IO-aware kernel \cite{ye2025flashinferefficientcustomizableattention} launch separate kernels for each shared prefix level. Even when launch overhead is eliminated via CUDA graphs, this decomposition introduces a fundamental utilization bottleneck when applied to the two-level draft-tree workload: the prefix phase is memory-bandwidth-bound and cannot fully occupy the GPU, while the many independent suffix problems are each too small to do so either. We propose a fused kernel that exploits this complementarity, by allocating only the resources necessary for the prefix computation, the remaining capacity is devoted to suffix workloads, which contend minimally with the memory-bound prefix for compute. This co-scheduling strategy achieves higher hardware utilization than prior kernels (Section~\ref{subsec:kernel_bench}).
+% \paragraph{CUDA Graph Compatibility}
+% Because the draft model is small, kernel launch overhead dominates execution time, making CUDA graph capture essential for efficient tree drafting.
+% However, existing tree-aware attention kernels such as FastTree~\cite{pan2025fasttree} and DeFT~\cite{yao2025deftdecodingflashtreeattention} are fundamentally incompatible with CUDA graphs.
+% Both systems use tree-topology-dependent kernel launch parameters: FastTree dispatches its Stage-1 kernel on a grid of $(\texttt{node\_num}, H_{kv})$ where $\texttt{node\_num}$ varies with the tree structure, and DeFT similarly varies its grid over the number of KV nodes and reallocates intermediate buffers each iteration as the tree is pruned and expanded.
+% CUDA graphs require all kernel launch parameters and tensor shapes to be fixed at capture time, so these data-dependent shapes cannot be captured.
+% Padding all tensors to a worst-case maximum would eliminate the benefits of tree-aware specialization.
+
+% \paragraph{Plan/Run Separation.}
+% Our approach is inspired by  FlashInfer's~\cite{ye2025flashinferefficientcustomizableattention}, which separates a CPU-side \texttt{plan()} phase from the GPU-side \texttt{run()} kernel.
+% The \texttt{run()} kernel itself has fixed tensor shapes and is CUDA graph compatible; the difficulty is that \texttt{plan()} must be called before each \texttt{run()} to populate the workspace buffers with the current step's KV indices.
+% The original \texttt{plan()} transfers GPU tensors to the CPU and calls \texttt{torch.cuda.synchronize()} before invoking a C++ scheduler, so it cannot be placed inside a captured graph.
+% A naive approach would call \texttt{plan()} before every graph replay, but the CPU--GPU synchronization it introduces serializes the pipeline and negates the benefit of graph capture.
+
+% \paragraph{GPU-Side Index Generation.}
+% We solve this by replacing the CPU scheduling logic with two Triton kernels that regenerate the Level-1 (shared prefix) and Level-2 (per-branch suffix) KV index arrays entirely on the GPU, eliminating the CPU--GPU synchronization that made the original \texttt{plan()} incompatible with graph capture. At capture time, \texttt{plan()} is called once to initialize the workspace and the \texttt{run()} kernel is recorded into the graph; at replay time, only the lightweight Triton regeneration runs before the captured graph, with no heavyweight C++ scheduler involved. The KV index buffer is pre-allocated to worst-case size at initialization, so no dynamic allocation occurs during inference.
+
+% \paragraph{Why Two Levels Enable This.}
+% The two-level cascade structure is key to making this efficient. The tree topology (topk, max depth, per-step branch pattern) is fixed at graph capture time, and we additionally model the draft tree as a two-level structure (prompt prefix plus per-branch draft suffix) so the shape itself is invariant across draft steps, even though the suffix grows by one token per step. A multi-level view would instead assign a new level at each branching point in the draft tree, so the level count would depend on the tree's branching structure; and since \texttt{plan()}'s scheduling metadata depends on the number of levels, any change to that structure would force a fresh plan. With the two-level view, the scheduling metadata that \texttt{plan()} computes (work distribution across SMs, KV chunking, and cross-level merge indices) depends only on shapes and can be computed once for the entire draft loop. We exploit this by instantiating one attention wrapper per draft step, running the full \texttt{plan()} on a single wrapper at capture time, and copying its workspace into the remaining N-1 wrappers; per-step wrappers are required because each draft step's \texttt{run()} reads its workspace pointers as graph-captured constants, so steps cannot share a single mutable workspace. During replay the planner is skipped entirely: the two Triton kernels regenerate the Level-1 and Level-2 KV indices in place, and a single GPU scatter updates the per-step Level-2 length counters in each wrapper's workspace, all before the captured graph is replayed. In steady state, replay performs zero \texttt{plan()} calls and no CPU-GPU synchronization.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+We conduct four sets of experiments to validate our approach:
+\textbf{(1)}~a micro-benchmark comparing our proposed two-level decomposition against
+multi-level cascade attention to empirically confirm the optimality analysis mentioned in Section~\ref{sec:optimal_grouping};
+\textbf{(2)}~a comparison of existing shared-prefix attention kernels applied
+to the draft-tree attention problem; and
+\textbf{(3)}~an end-to-end speculative decoding speedup analysis. \textbf{(4)}~an ablation study of how each optimization contributes to the speed up.
+
+\subsection{Comparison Between Two-Level and Multi-Level Attention}
+\label{subsec:exp_twolevel}
+
+We empirically verify the analysis of Section~\ref{sec:optimal_grouping} by
+comparing the latency of two-level decomposition against the multi-level approach,
+where additional grouping levels are introduced within the draft tree at every
+branching point. All experiments use a prefix length of $L = 50$K,
+$H_q = 32$ query heads, $H_{kv} = 8$ KV heads (GQA ratio $R = 4$), and head
+dimension $d = 128$, matching the configuration of Llama-3-8B.
+
+We sweep tree width $W \in \{4, \ldots, 16\}$ and depth
+$D \in \{2, \ldots 20\}$ under three draft-tree distributions
+that span the spectrum of sharing structure:
+\begin{itemize}
+  \item \textbf{Min Sharing.} Each leaf follows a maximally distinct path
+    through the tree, minimizing the KV cache shared among sibling queries
+    within the draft tree. This is the least favourable scenario for
+    multi-level grouping due to almost no intermediate sub-prefix to exploit.
+
+  \item \textbf{Max Sharing.} All leaves share a single long draft path up to
+    the penultimate level before diverging, maximizing the shared sub-prefix
+    within the draft tree. This is the most favourable scenario for
+    multi-level grouping, as the intermediate sharing benefit is
+    the largest.
+
+    \item \textbf{Tree Sampling (Realistic Drafting).} Draft trees are constructed by sampling from the speculative decoding process, accumulating log-probabilities along each path and retaining the top-$k$ continuations at each expansion step to approximate the distribution of draft trees encountered in realistic speculative decoding.
+\end{itemize}
+
+\begin{figure*}[htb]
+  \centering
+  \includesvg[width=\textwidth]{forced-two-level-comparison.svg}
+  \caption{Two-level vs.\ multi-level attention speedup across tree
+    width $W$ and depth $D$ ($L = 50\text{K}$, $H_q/H_{kv} = 32/8$, $d = 128$).
+    Heatmaps of speedup ratio $T_{\text{multi}} / T_{\text{two-level}}$
+    (blue~=~two-level wins)}
+  \label{fig:twolevel_vs_multilevel}
+\end{figure*}
+
+
+Figure~\ref{fig:twolevel_vs_multilevel} reports the speedup ratio
+$T_{\text{multi}} / T_{\text{two-level}}$ across all $(W, D)$ configurations, where $T_{multi}$ is the latency of our implementation of multi-level approach and $T_{two-level}$ is the latency of our two-level approach.
+A ratio greater than one indicates that the two-level scheme is faster.
+In the minimum sharing case, the two-level decomposition outperforms
+multi-level attention by $1.03\times$--$1.44\times$, with the advantage
+growing with tree depth as the per-level merge overhead accumulates in the
+multi-level scheme.
+In the maximum sharing case, which is the most favorable setting for
+multi-level grouping, multi-level attention exhibits only a very small
+crossover at large depths. Starting around $D=16$, the best observed ratio
+drops to about $0.98\times$. 
+
+Under the tree sampling distribution, which reflects realistic drafting
+behavior, the two-level scheme remains faster across all tested configurations.
+This is the most relevant regime for speculative decoding systems, where draft
+depths are typically shallow. Speculative decoding methods with draft models from the same family (e.g., Llama-3.2-1B drafts for Llama-3.1-8B)
+usually perform best around $D=6$--$10$; EAGLE-3~\cite{li2025eagle3scalinginferenceacceleration} uses $D \le 8$, SpecInfer~\cite{Miao_2024}
+uses $D=8$. Even Sequoia~\cite{chen2025sequoiascalablerobusthardwareaware}, which explores
+deeper trees, uses depths around $D=18$ mainly in offloading settings where
+the tree must be deeper to offset communication and memory-transfer overheads.
+
+Overall, these experiments support the assumption in Section~\ref{sec:optimal_grouping} that practical draft trees are too shallow for additional intra-tree prefix sharing to provide a meaningful benefit. Thus, two-level decomposition is the preferred practical design point for tree-based speculative decoding.
+
+
+\subsection{Kernel Benchmark on Draft Tree Problem}
+\label{subsec:kernel_bench}
+In this section we evaluate the speedups brought by our kernel against existing prefix-IO-aware attention kernels on two-level draft tree structures.  
+%Having shown in Section \ref{sec:optimal_grouping} that two levels are the preferred query grouping strategy for the practical tree-based drafting regimes, we benchmark our kernel against existing prefix-IO-aware attention kernels on two-level tree structures. 
+Here, three baselines are compared: FlashInfer's multi-level cascade attention~\cite{ye2025flashinferefficientcustomizableattention}, FastTree~\cite{pan2025fasttree}, and DeFT~\cite{yao2025deftdecodingflashtreeattention}. Since these kernel implementations are optimized for H100 as stated in their paper, we conduct the experiments on H100.
+We evaluate prefix lengths ranging from 2K to 32K tokens, batch size $\in \{1, 8\}$, and draft widths $k \in \{8, 16\}$. For each configuration, we sweep suffix lengths from 1 to 16 and report the average over 50 runs for each tree structure, simulating the range of draft tree depths encountered in practice. All kernels are benchmarked in isolation with CUDA Graphs enabled, so that the results isolate attention computation from end-to-end framework overhead. Although some baseline kernels do not support CUDA Graph replay in fully dynamic serving workloads, this micro-benchmark uses a fixed tree structure within each set of 50 runs, making the input shapes, tree topology, and buffer layouts static and therefore CUDA-Graph-capturable for all evaluated kernels.
+
+Figure~\ref{fig:kernel-bars-h100} reports speedups over PagedAttention \cite{kwon2023efficientmemorymanagementlarge}. Our kernel consistently achieves the highest speedup across nearly all settings, with the advantage widening as prefix length and draft width grow. For example, at the setting of $H_q{=}32, H_{kv}{=}8, B{=}8, k{=}16$, our speedup rises from $2.20\times$ at 2K to $4.92\times$ at 32K, reflecting the increasing benefit of prefix-IO reuse as the shared KV cache dominates memory traffic. Among the baselines, FastTree performs best in the isolated kernel benchmark, but still trails our kernel by roughly 1.1–1.6× across settings, while FlashInfer frequently falls below $1\times$. Doubling the draft width from $k{=}8$ to $k{=}16$ consistently amplifies our lead by exposing more query-side parallelism per KV load, with peak speedups of up to $4.92\times$.
+
+Note that this benchmark is intentionally favorable to the baselines: by fixing the tree structure within each set of 50 runs, every kernel — including those whose dynamic planning precludes CUDA Graph capture in real serving — executes under CUDA Graphs here. The 1.1–1.6× advantage FastDraft retains over the strongest baseline (FastTree) in this best-case setting therefore isolates the kernel-level contribution from the scheduling and graph-replay benefits measured in Section \ref{subsec:e2e_benchmark}.
+
+\input{kernel_bar_h100} 
+
+\subsection{End-to-End Speedup}
+\label{subsec:e2e_benchmark}
+Whereas Section \ref{subsec:kernel_bench} holds the tree shape fixed across each run set and thereby grants every kernel CUDA Graph capture, real serving exposes a draft loop in which baseline kernels fall back to ungraphed execution because their multi-level planning shape evolves across draft steps. The end-to-end results in this section therefore reflect both the kernel-level gap from Section~\ref{subsec:kernel_bench} and the additional cost of ungraphed scheduling for baselines that cannot satisfy FastDraft's static-planning property.
+
+We implement FastDraft as a toggleable module on SGLang v0.5.9 and benchmark output tokens per second alongside draft and verify latency for both classic speculative decoding and EAGLE3~\cite{li2025eaglespeculativesamplingrequires}. We also integrate the FastTree kernel into SGLang as the strongest prior tree-aware kernel baseline for the draft-tree attention problem. We evaluate across three long-context datasets, GovReport~\cite{huang-etal-2021-efficient}, NarrativeQA~\cite{kočiský2017narrativeqareadingcomprehensionchallenge}, and PG-19~\cite{raecompressive2019}, covering context lengths ranging from 10K to 100K tokens. To demonstrate the generality of our method, we benchmark across a range of hardware devices, model sizes from 4B to 70B, and varying top-$k$ settings. We also evaluate batched servings with batch sizes of 4 and 8 to test whether FastDraft’s benefits persist beyond single-request decoding.
+
+As shown in Table~\ref{tab:speculative_decoding},
+FastDraft consistently delivers the best end-to-end performance in all evaluated settings, achieving the lowest draft latency and the highest speedup over autoregressive decoding, while leaving verification time and accept length unchanged relative to the SGLang baseline. These gains arise from treating CUDA-Graph compatibility as a first-class design constraint of the draft phase, rather than as a downstream engineering convenience. FastTree, on the other hand,  although is a prefix-aware kernel that reduces KV-cache traffic, it is consistently slower than the non-prefix-aware SGLang baseline, because its reliance on dynamic input shapes precludes CUDA Graph capture of the draft loop, while FastDraft resolves this by exploiting the two-level draft structure, which uses static planning: a single plan is reused across draft steps under CUDA Graph replay, eliminating per-step host-side scheduling.
+
+Table \ref{tab:batch-e2e} shows that FastDraft’s gains carry over to batched serving across different hardware settings. On NarrativeQA with a single RTX Pro 6000, FastDraft improves throughput over SGLang from 128.47 to 212.20 tokens/s at batch size 4 and from 131.42 to 226.16 tokens/s at batch size 8. On two A6000 GPUs, FastDraft improves throughput over SGLang from 103.97 to 183.55 tokens/s at batch size 4. Overall, FastDraft achieves up to 1.77$\times$ higher throughput over SGLang and up to 2.66$\times$ faster draft execution.
+
+All these results demonstrate that FastDraft is a practical drop-in acceleration for tree-based speculative decoding, whose end-to-end benefits arise from the combination of a structure-aware formulation and an efficient execution strategy.
+
+\input{end2end_table}
+
+
+\begin{table}
+\centering
+\caption{Comparison of autoregressive (AR), SGLang, and our method on NarrativeQA 
+(target: Llama-3.1-8B, draft: Llama-3.2-1B, top-$k$=10, steps=7). 
+B denotes batch size; Tput denotes decoding throughput in tokens per second. 
+Tput speedups are relative to AR; draft speedups are relative to SGLang 
+(AR has no draft phase).}
+\label{tab:batch-e2e}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{0.95}
+\begin{tabular}{llccccc}
+\toprule
+Method & B & Draft (s) & Verify (s) & Tput (tok/s) & Tput Sp. & Draft Sp. \\
+\midrule
+\multicolumn{7}{c}{\textbf{RTX Pro 6000 $\times$ 1}} \\
+\midrule
+AR             & \multirow{3}{*}{4} & ---  & ---  & 101.13 & 1.00$\times$ & --- \\
+SGLang         &                    & 7.07 & 2.18 & 128.47 & 1.27$\times$ & 1.00$\times$ \\
+Ours           &                    & 2.85 & 2.22 & 212.20 & 2.10$\times$ & 2.49$\times$ \\
+\midrule
+AR             & \multirow{3}{*}{8} & ---  & ---  & 108.15 & 1.00$\times$ & --- \\
+SGLang         &                    & 7.38 & 2.33 & 131.42 & 1.22$\times$ & 1.00$\times$ \\
+Ours           &                    & 2.94 & 2.33 & 226.16 & 2.09$\times$ & 2.51$\times$ \\
+\midrule
+\multicolumn{7}{c}{\textbf{A6000 $\times$ 2}} \\
+\midrule
+AR             & \multirow{3}{*}{4} & ---  & ---  & 96.65  & 1.00$\times$ & --- \\
+SGLang         &                    & 8.72 & 2.72 & 103.97 & 1.08$\times$ & 1.00$\times$ \\
+Ours           &                    & 3.27 & 2.75 & 183.55 & 1.90$\times$ & 2.66$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation Study}
+To quantify the contribution of each FastDraft component, we perform a step-by-step ablation starting from the CUDA-Graph-enabled SGLang draft backend. We first replace the SGLang draft backend with our specialized kernel, then enable CUDA Graph support for our kernel, and finally reuse the planning schedule across multiple draft steps. Figure~\ref{fig:ablation} reports the draft-phase speedup on NarrativeQA at batch size 4, using Llama-3.2-1B as the draft model and Llama-3.1-8B as the target model on two A6000.  Each component provides a consistent improvement, yielding speedups of 2.0$\times$, 1.17$\times$, and 1.14$\times$, respectively. Combined, these optimizations achieve an overall draft-phase speedup of 2.66$\times$.
+
+\begin{figure*}[h]
+  \centering
+  \includesvg[width=0.7\textwidth]{ablation_study.svg}
+  \caption{Draft-phase ablation study of FastDraft on NarrativeQA at batch size 4, using Llama-3.2-1B as the draft model and Llama-3.1-8B as the target model.}
+  \label{fig:ablation}
+\end{figure*}
+
+
+
+
+
+\section{Conclusion}
+
+We presented FastDraft, a drop-in acceleration module for tree-based speculative decoding built on a single insight: the draft-phase attention workload is fundamentally two levels, a long verified prefix followed by a short branching suffix, and deserves to be treated as such rather than as a special case of general multi-level prefix hierarchies. We formalized this decomposition, and showed through a cost model together with empirical evaluation that, across practical draft-tree topologies, two levels are the preferred design point for existing tree-based drafting workloads, and designed a kernel that exploits shared prefix and retains full CUDA Graph compatibility. Integrated into SGLang, FastDraft delivers up to $2.66\times$ faster draft execution and meaningful end-to-end throughput gains, with consistent improvements across hardware (A6000 to H100), model sizes (4B to 70B), and long-context workloads from 10K to 100K tokens.
+
+
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+\clearpage
+
+
+\medskip
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendix
+
+\paragraph{Limitations}
+
+FastDraft is most effective in long-context settings where the draft phase contributes a substantial portion of the overall decoding latency. When the context is short, the shared-prefix region is small, so the opportunity to reduce redundant KV-cache loads is limited. This effect is also reflected quantitatively in our kernel benchmark Section \ref{subsec:kernel_bench}: at a prefix length of 2K tokens, batch size 1, FastDraft achieves only around 1.1× speedup over PagedAttention, compared to significantly larger gains at longer prefixes. In this regime, the benefit of our prefix sharing kernel becomes correspondingly smaller.
+
+In addition, the end-to-end speedup depends on how much time is spent in the draft phase relative to verification. If the draft phase is already short compared to the verify phase, then reducing draft latency yields only limited overall improvement, even if the draft kernel itself is accelerated. Therefore, the gains of FastDraft are largest when draft-side attention is a meaningful bottleneck, and smaller when verification dominates the decoding step.
+
+\paragraph{Reproducibility.} We provide the full implementation and scripts required to reproduce the main experiments as part of the review materials. Upon acceptance, the code will be released publicly on GitHub.
+All experiments are conducted on multiple virtual machines provisioned through verda.com, a cloud provider. Each virtual machine is equipped with GPUs of a single type: NVIDIA RTX A6000, NVIDIA H100, or NVIDIA RTX PRO 6000. The machines use the x86\_64 architecture with 60 online CPUs, AMD EPYC 9555 64-Core processors, 128 GB of RAM, and a 500 GB SSD. Running the full set of reported experiments takes approximately two full days.
+
+\paragraph{Assets and licenses.}
+Our experiments use existing datasets, model checkpoints, and software systems, which are credited through the corresponding citations. The datasets include GovReport~\cite{huang-etal-2021-efficient}, licensed under CC BY 4.0; NarrativeQA~\citep{kočiský2017narrativeqareadingcomprehensionchallenge}, licensed under the Apache License 2.0; and PG-19~\cite{raecompressive2019}, licensed under the Apache License 2.0. The Llama-family model checkpoints, including Llama-3.1-8B, Llama-3.2-1B, and Llama-3.3-70B, are used under the corresponding Llama 3.1, Llama 3.2, and Llama 3.3 Community Licenses and Acceptable Use Policies. The Qwen-family checkpoints, including Qwen3-4B and the Qwen EAGLE draft checkpoints used in our experiments, are used under the Apache License 2.0. The software assets include SGLang~\cite{10.5555/3737916.3739916}, FlashInfer~\cite{ye2025flashinferefficientcustomizableattention}, FastTree~\citep{pan2025fasttree}, EAGLE3 ~\cite{li2025eagle3scalinginferenceacceleration}, and DeFT~\cite{yao2025deftdecodingflashtreeattention}. SGLang, FlashInfer, FastTree, and EAGLE are licensed under the Apache License 2.0, while DeFT is licensed under the MIT License. We use these assets only for benchmarking and comparison, and comply with their licenses and terms of use. The released FastDraft code will include license and attribution information for all reused assets.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\input{checklist.tex}
+
+
+\end{document}
