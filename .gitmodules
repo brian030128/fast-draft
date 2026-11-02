@@ -1,7 +1,7 @@
 [submodule "3rdparty/flashinfer"]
 	path = 3rdparty/flashinfer
 	url = git@github.com:brian030128/flashinfer.git
-	branch = cascade-persistent-fusion
+	branch = a6000_optimization
 [submodule "3rdparty/sglang"]
 	path = 3rdparty/sglang
 	url = git@github.com:brian030128/sglang.git
@@ -11,3 +11,6 @@
 [submodule "3rdparty/FastTree-Artifact"]
 	path = 3rdparty/FastTree-Artifact
 	url = git@github.com:brian030128/FastTree-Artifact.git
+[submodule "3rdparty/hydragen"]
+	path = 3rdparty/hydragen
+	url = https://github.com/ScalingIntelligence/hydragen.git

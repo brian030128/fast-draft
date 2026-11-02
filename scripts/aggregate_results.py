@@ -18,7 +18,7 @@ GPU_PREFIXES = ["H200_", "H100_", "A6000_", "PRO6000_", "PRO6000"]
 # Regex for speculative decoding filenames:
 #   [wo_graph_]standalone_{method}_{target}_{draft}_top{k}_{steps}_{dataset}[_temp{t}]_bs{bs}.csv
 SPEC_RE = re.compile(
-    r"^(wo_graph_)?standalone_(cascade_per_step_no_cg|cascade_per_step|cascade_no_cg|cascade|fasttree|paged_no_cg|paged|vllm)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
+    r"^(wo_graph_)?standalone_(cascade_per_step_no_cg|cascade_per_step|cascade_no_cg|fi_cascade|cascade|fasttree|hydragen|deft|paged_no_cg|paged|vllm)_(.+?)_(.+?)_top(\d+)_(\d+)_(.+?)(?:_(temp[^_]+))?_bs(\d+)\.csv$"
 )
 
 
@@ -231,7 +231,7 @@ def add_speedups(summary: pd.DataFrame, grouped: dict) -> pd.DataFrame:
 
             # Cascade/FastTree/vLLM/paged_no_cg/cascade_per_step vs paged (within same graph/no-graph group)
             if method in ("cascade", "cascade_no_cg", "cascade_per_step", "cascade_per_step_no_cg",
-                          "fasttree", "vllm", "paged_no_cg") and len(paged_row) > 0:
+                          "fasttree", "vllm", "paged_no_cg", "fi_cascade", "hydragen", "deft") and len(paged_row) > 0:
                 ref_paged = paged_row
                 ref_paged_method = "paged"
             elif method == "cascade_wo_graph" and len(paged_wo_graph_row) > 0:
