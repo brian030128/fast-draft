@@ -1,7 +1,7 @@
 \begin{table}
 \centering
 % \caption{Speculative decoding benchmarks across datasets, model pairs, and devices. Speedup is decoding-time speedup relative to autoregressive (AR) baseline. Bold indicates the shortest draft time and the highest speedup within each group. Values reported as mean $\pm$ std.}
-\caption{Speedup is decoding-time speedup relative to autoregressive (AR) baseline. Bold indicates the shortest draft time and the highest speedup within each group. Values reported as mean $\pm$ std.}
+\caption{Speedup is decoding-time speedup relative to autoregressive (AR) baseline. Bold indicates the shortest draft time and the highest speedup within each group. Values reported as mean $\pm$ std. Hydragen runs without CUDA Graphs (its draft-step inputs change shape every step) and is evaluated in the A6000 Llama settings.}
 \label{tab:speculative_decoding}
 \resizebox{\columnwidth}{!}{%
 \begin{tabular}{lllcrrrrr}
@@ -10,23 +10,26 @@
 \midrule
 \multicolumn{9}{c}{\textbf{A6000 $\times$ 2}} \\
 \midrule
-\multirow{3}{*}{Gov Report}
-  & \multirow{3}{*}{Llama-3.1-8B} & \multirow{3}{*}{Llama-3.2-1B} & \multirow{3}{*}{10}
+\multirow{4}{*}{Gov Report}
+  & \multirow{4}{*}{Llama-3.1-8B} & \multirow{4}{*}{Llama-3.2-1B} & \multirow{4}{*}{10}
   & Ours         & $\mathbf{1.75 \pm 0.33}$ & $1.38 \pm 0.25$ & $6.47 \pm 0.97$ & $\mathbf{2.14 \pm 0.34\times}$ \\
   & & & & SGLang       & $2.75 \pm 0.67$ & $1.41 \pm 0.30$ & $6.45 \pm 1.04$ & $1.66 \pm 0.28\times$ \\
   & & & & FastTree     & $4.63 \pm 0.90$ & $1.39 \pm 0.27$ & $6.45 \pm 1.00$ & $1.17 \pm 0.19\times$ \\
+  & & & & Hydragen     & $6.48 \pm 1.47$ & $1.40 \pm 0.28$ & $6.50 \pm 0.98$ & $0.91 \pm 0.16\times$ \\
 \midrule
-\multirow{3}{*}{NarrativeQA}
-  & \multirow{3}{*}{Llama-3.1-8B} & \multirow{3}{*}{Llama-3.2-1B} & \multirow{3}{*}{10}
+\multirow{4}{*}{NarrativeQA}
+  & \multirow{4}{*}{Llama-3.1-8B} & \multirow{4}{*}{Llama-3.2-1B} & \multirow{4}{*}{10}
   & Ours         & $\mathbf{2.02 \pm 0.37}$ & $1.57 \pm 0.28$ & $6.56 \pm 0.81$ & $\mathbf{2.17 \pm 0.27\times}$ \\
   & & & & SGLang       & $4.07 \pm 1.04$ & $1.57 \pm 0.26$ & $6.52 \pm 0.80$ & $1.44 \pm 0.20\times$ \\
   & & & & FastTree     & $4.50 \pm 0.77$ & $1.55 \pm 0.28$ & $6.51 \pm 0.82$ & $1.35 \pm 0.20\times$ \\
+  & & & & Hydragen     & $6.20 \pm 1.39$ & $1.57 \pm 0.29$ & $6.56 \pm 0.80$ & $1.06 \pm 0.19\times$ \\
 \midrule
-\multirow{3}{*}{PG-19}
-  & \multirow{3}{*}{Llama-3.1-8B} & \multirow{3}{*}{Llama-3.2-1B} & \multirow{3}{*}{10}
+\multirow{4}{*}{PG-19}
+  & \multirow{4}{*}{Llama-3.1-8B} & \multirow{4}{*}{Llama-3.2-1B} & \multirow{4}{*}{10}
   & Ours         & $\mathbf{1.96 \pm 0.39}$ & $1.53 \pm 0.29$ & $6.58 \pm 0.63$ & $\mathbf{2.20 \pm 0.21\times}$ \\
   & & & & SGLang       & $3.82 \pm 1.34$ & $1.52 \pm 0.28$ & $6.65 \pm 0.52$ & $1.49 \pm 0.25\times$ \\
   & & & & FastTree     & $4.52 \pm 0.62$ & $1.51 \pm 0.29$ & $6.61 \pm 0.54$ & $1.33 \pm 0.14\times$ \\
+  & & & & Hydragen     & $7.82 \pm 1.27$ & $1.59 \pm 0.28$ & $6.63 \pm 0.58$ & $0.87 \pm 0.14\times$ \\
 \midrule
 \multirow{3}{*}{Gov Report}
   & \multirow{3}{*}{Qwen3-4B} & \multirow{3}{*}{Qwen3-4B-EAGLE3} & \multirow{3}{*}{10}
