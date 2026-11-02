@@ -101,7 +101,7 @@ page IDs identifying distinct KV entries in memory; sibling queries that
 share an ancestor reference the same page ID. For example, the tree encodes the following ancestor relationships: $q_1$ descends through
 $p_{10} \to p_{11} \to p_{13}$; $q_2$ through $p_{10} \to p_{12} \to p_{14}$;
 and $q_3$ through $p_{10} \to p_{12} \to p_{15}$. Here, the page $p_{10}$ lies on the
-shared prefix common to all three queries, while $p_{12}$ is shared only between
+shared prefix common to all three queries, while $p_{12}$ lies on a \emph{shared sub-path} of the draft tree, used only by
 $q_2$ and $q_3$.
 
 While the draft tree naturally exposes sharing across queries, existing
@@ -112,7 +112,7 @@ Although pages $p_1, p_2, \ldots, p_{10}$ are on the shared prefix, these KV pag
 % This leads to substantial redundancy: pages on shared prefixes (e.g., $p_{10}$) are loaded repeatedly for each query, even though they are identical.
 
 \subsection{Two-Level Attention Computation}\label{sec:two-level_attn_comp}
-To reduce redundant KV loads during the draft phase of tree-based speculative decoding, we propose a two-level attention kernel. As illustrated in Figure~\ref{fig:draft_tree_before_flatten}(c), instead of computing the full attention over $\mathrm{KV}(q_i)$ for each query independently and loading its entire path of KV pages, we partition the KV cache into two parts, the shared prefix and the branching suffix. A shared prefix consists of the prompt and all previously accepted tokens. A branching suffix is the shallow tree of candidate continuations generated during the draft phase.
+To reduce redundant KV loads during the draft phase of tree-based speculative decoding, we propose a two-level attention kernel. As illustrated in Figure~\ref{fig:draft_tree_before_flatten}(c), instead of computing the full attention over $\mathrm{KV}(q_i)$ for each query independently and loading its entire path of KV pages, we partition the KV cache into two parts, the shared prefix and the branching suffix. The shared prefix consists of the prompt and all previously accepted tokens, i.e., the full context that every branch of the draft tree attends to; its length $L$ is the context length, not a property of the draft tree. A branching suffix is the shallow tree of candidate continuations generated during the draft phase. Throughout the paper, ``prefix'' always refers to this shared context, and segments of the draft tree that are shared by only a subset of branches are called shared sub-paths. The draft model attends over the shared prefix at every draft step. This holds for standalone draft models and for EAGLE-style drafters alike, since each draft token attends over the KV cache of the full context, which is exactly the traffic that FastDraft reduces.
 This induces a natural two-level structure:
 \[
 \text{KV}(q_i) = 
@@ -248,9 +248,9 @@ Equivalently, the crossover depth becomes
   1 +
   \frac{\gamma N + \lambda}{N-1}.
 \]
-The equation suggests that adding grouping levels inside the draft tree is unlikely to be beneficial for practical speculative decoding workloads. Each additional level introduces fixed merging, scheduling, and kernel fragmentation overhead, while its only potential benefit is to reduce redundant KV traffic along shared prefixes in common sub-paths. This benefit is limited by the depth of the draft tree. In current systems, the branching suffix is short, so there are too few draft tokens over which intermediate prefix sharing can amortize the extra overhead.
+The equation suggests that adding grouping levels inside the draft tree is unlikely to be beneficial for practical speculative decoding workloads. Each additional level introduces fixed merging, scheduling, and kernel fragmentation overhead, while its only potential benefit is to reduce redundant KV traffic along shared sub-paths. This benefit is limited by the depth of the draft tree. In current systems, the branching suffix is short, so there are too few draft tokens over which intermediate prefix sharing can amortize the extra overhead.
 
-Under the assumption that the current draft trees are short, the two-level decomposition is the preferred design point. It captures the dominant source of reuse, that is, the long verified prefix shared by all draft queries, while avoiding the additional costs introduced by finer-grained multi-level grouping. Additional levels may only become beneficial for substantially deeper draft trees, where intermediate shared prefixes are long enough to offset their merge and scheduling overheads. We validate this assumption empirically in Section~\ref{subsec:exp_twolevel}.
+Under the assumption that the current draft trees are short, the two-level decomposition is the preferred design point. It captures the dominant source of reuse, that is, the long verified prefix shared by all draft queries, while avoiding the additional costs introduced by finer-grained multi-level grouping. Additional levels may only become beneficial for substantially deeper draft trees, where shared sub-paths are long enough to offset their merge and scheduling overheads. We validate this assumption empirically in Section~\ref{subsec:exp_twolevel}.
 
 % \subsection{Kernel}
 % \label{sec:kernel}
@@ -575,10 +575,10 @@ that span the spectrum of sharing structure:
   \item \textbf{Min Sharing.} Each leaf follows a maximally distinct path
     through the tree, minimizing the KV cache shared among sibling queries
     within the draft tree. This is the least favourable scenario for
-    multi-level grouping due to almost no intermediate sub-prefix to exploit.
+    multi-level grouping due to almost no shared sub-path to exploit.
 
   \item \textbf{Max Sharing.} All leaves share a single long draft path up to
-    the penultimate level before diverging, maximizing the shared sub-prefix
+    the penultimate level before diverging, maximizing the shared sub-path
     within the draft tree. This is the most favourable scenario for
     multi-level grouping, as the intermediate sharing benefit is
     the largest.
@@ -618,7 +618,7 @@ uses $D=8$. Even Sequoia~\cite{chen2025sequoiascalablerobusthardwareaware}, whic
 deeper trees, uses depths around $D=18$ mainly in offloading settings where
 the tree must be deeper to offset communication and memory-transfer overheads.
 
-Overall, these experiments support the assumption in Section~\ref{sec:optimal_grouping} that practical draft trees are too shallow for additional intra-tree prefix sharing to provide a meaningful benefit. Thus, two-level decomposition is the preferred practical design point for tree-based speculative decoding.
+Overall, these experiments support the assumption in Section~\ref{sec:optimal_grouping} that practical draft trees are too shallow for additional sharing along sub-paths to provide a meaningful benefit. Thus, two-level decomposition is the preferred practical design point for tree-based speculative decoding.
 
 
 \subsection{Kernel Benchmark on Draft Tree Problem}
@@ -626,7 +626,7 @@ Overall, these experiments support the assumption in Section~\ref{sec:optimal_gr
 In this section we evaluate the speedups brought by our kernel against existing prefix-IO-aware attention kernels on two-level draft tree structures.  
 %Having shown in Section \ref{sec:optimal_grouping} that two levels are the preferred query grouping strategy for the practical tree-based drafting regimes, we benchmark our kernel against existing prefix-IO-aware attention kernels on two-level tree structures. 
 Here, three baselines are compared: FlashInfer's multi-level cascade attention~\cite{ye2025flashinferefficientcustomizableattention}, FastTree~\cite{pan2025fasttree}, and DeFT~\cite{yao2025deftdecodingflashtreeattention}. Since these kernel implementations are optimized for H100 as stated in their paper, we conduct the experiments on H100.
-We evaluate prefix lengths ranging from 2K to 32K tokens, batch size $\in \{1, 8\}$, and draft widths $k \in \{8, 16\}$. For each configuration, we sweep suffix lengths from 1 to 16 and report the average over 50 runs for each tree structure, simulating the range of draft tree depths encountered in practice. All kernels are benchmarked in isolation with CUDA Graphs enabled, so that the results isolate attention computation from end-to-end framework overhead. Although some baseline kernels do not support CUDA Graph replay in fully dynamic serving workloads, this micro-benchmark uses a fixed tree structure within each set of 50 runs, making the input shapes, tree topology, and buffer layouts static and therefore CUDA-Graph-capturable for all evaluated kernels.
+We evaluate prefix (context) lengths ranging from 2K to 32K tokens, batch size $\in \{1, 8\}$, and draft widths $k \in \{8, 16\}$. For each configuration, we sweep suffix lengths from 1 to 16 and report the average over 50 runs for each tree structure, simulating the range of draft tree depths encountered in practice. All kernels are benchmarked in isolation with CUDA Graphs enabled, so that the results isolate attention computation from end-to-end framework overhead. Although some baseline kernels do not support CUDA Graph replay in fully dynamic serving workloads, this micro-benchmark uses a fixed tree structure within each set of 50 runs, making the input shapes, tree topology, and buffer layouts static and therefore CUDA-Graph-capturable for all evaluated kernels.
 
 Figure~\ref{fig:kernel-bars-h100} reports speedups over PagedAttention \cite{kwon2023efficientmemorymanagementlarge}. Our kernel consistently achieves the highest speedup across nearly all settings, with the advantage widening as prefix length and draft width grow. For example, at the setting of $H_q{=}32, H_{kv}{=}8, B{=}8, k{=}16$, our speedup rises from $2.20\times$ at 2K to $4.92\times$ at 32K, reflecting the increasing benefit of prefix-IO reuse as the shared KV cache dominates memory traffic. Among the baselines, FastTree performs best in the isolated kernel benchmark, but still trails our kernel by roughly 1.1–1.6× across settings, while FlashInfer frequently falls below $1\times$. Doubling the draft width from $k{=}8$ to $k{=}16$ consistently amplifies our lead by exposing more query-side parallelism per KV load, with peak speedups of up to $4.92\times$.
 
