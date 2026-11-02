@@ -645,6 +645,8 @@ FastDraft consistently delivers the best end-to-end performance in all evaluated
 
 Table \ref{tab:batch-e2e} shows that FastDraft’s gains carry over to batched serving across different hardware settings. On NarrativeQA with a single RTX Pro 6000, FastDraft improves throughput over SGLang from 128.47 to 212.20 tokens/s at batch size 4 and from 131.42 to 226.16 tokens/s at batch size 8. On two A6000 GPUs, FastDraft improves throughput over SGLang from 103.97 to 193.18 tokens/s at batch size 4. Overall, FastDraft achieves up to 1.86$\times$ higher throughput over SGLang and up to 2.92$\times$ faster draft execution.
 
+Table~\ref{tab:speculative_decoding} reports decoding-time speedups, which isolate the phase that FastDraft accelerates; with long outputs, as in reasoning workloads, decoding dominates total latency. For completeness, Table~\ref{tab:e2e_with_prefill} in the appendix reports speedups of the full request latency including prefill for the A6000 settings. Because prefill takes 31--53\% of the autoregressive request time at these 10K--100K-token contexts with 512 output tokens, the ratios are smaller, but FastDraft remains the fastest method in every setting.
+
 All these results demonstrate that FastDraft is a practical drop-in acceleration for tree-based speculative decoding, whose end-to-end benefits arise from the combination of a structure-aware formulation and an efficient execution strategy.
 
 \input{end2end_table}
@@ -735,6 +737,34 @@ We presented FastDraft, a drop-in acceleration module for tree-based speculative
 FastDraft is most effective in long-context settings where the draft phase contributes a substantial portion of the overall decoding latency. When the context is short, the shared-prefix region is small, so the opportunity to reduce redundant KV-cache loads is limited. This effect is also reflected quantitatively in our kernel benchmark Section \ref{subsec:kernel_bench}: at a prefix length of 2K tokens, batch size 1, FastDraft achieves only around 1.1× speedup over PagedAttention, compared to significantly larger gains at longer prefixes. In this regime, the benefit of our prefix sharing kernel becomes correspondingly smaller.
 
 In addition, the end-to-end speedup depends on how much time is spent in the draft phase relative to verification. If the draft phase is already short compared to the verify phase, then reducing draft latency yields only limited overall improvement, even if the draft kernel itself is accelerated. Therefore, the gains of FastDraft are largest when draft-side attention is a meaningful bottleneck, and smaller when verification dominates the decoding step.
+
+\paragraph{Latency including prefill.}
+Table~\ref{tab:e2e_with_prefill} complements Table~\ref{tab:speculative_decoding} with speedups of the full request latency (prefill and decoding, 512 output tokens) over autoregressive decoding, for the A6000 settings. The same runs are used: decoding speedup is the ratio of mean decoding times as in Table~\ref{tab:speculative_decoding}, and full-latency speedup the ratio of mean request latencies (std over per-prompt ratios). FastDraft accelerates only decoding, so its full-latency gain shrinks as prefill takes a larger share of the request.
+
+\begin{table}[h]
+\centering
+\caption{Speedup over autoregressive decoding on A6000$\times$2, decoding only vs.\ full request latency including prefill (512 output tokens). Prefill share is the fraction of the autoregressive request latency spent in prefill.}
+\label{tab:e2e_with_prefill}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+Target / Draft & Dataset & Prefill share & Ours & SGLang & FastTree \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Llama-3.1-8B /\\ Llama-3.2-1B}}
+ & Gov Report  & 31\% & $\mathbf{2.14}$ / $\mathbf{1.43 \pm 0.15}$ & 1.66 / $1.21 \pm 0.14$ & 1.17 / $1.00 \pm 0.10$ \\
+ & NarrativeQA & 51\% & $\mathbf{2.17}$ / $\mathbf{1.17 \pm 0.14}$ & 1.44 / $1.03 \pm 0.12$ & 1.35 / $1.01 \pm 0.07$ \\
+ & PG-19       & 51\% & $\mathbf{2.20}$ / $\mathbf{1.18 \pm 0.22}$ & 1.49 / $1.01 \pm 0.19$ & 1.33 / $0.97 \pm 0.06$ \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Qwen3-4B /\\ Qwen3-4B-EAGLE3}}
+ & Gov Report  & 33\% & $\mathbf{2.05}$ / $\mathbf{1.47 \pm 0.13}$ & 1.96 / $1.44 \pm 0.13$ & 1.49 / $1.25 \pm 0.11$ \\
+ & NarrativeQA & 53\% & $\mathbf{1.66}$ / $\mathbf{1.19 \pm 0.14}$ & 1.51 / $1.15 \pm 0.14$ & 1.21 / $1.06 \pm 0.13$ \\
+ & PG-19       & 53\% & $\mathbf{1.96}$ / $\mathbf{1.25 \pm 0.14}$ & 1.77 / $1.21 \pm 0.12$ & 1.43 / $1.12 \pm 0.10$ \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize Each cell: decoding speedup / full-latency speedup.}
+\end{table}
 
 \paragraph{Reproducibility.} We provide the full implementation and scripts required to reproduce the main experiments as part of the review materials. Upon acceptance, the code will be released publicly on GitHub.
 All experiments are conducted on multiple virtual machines provisioned through verda.com, a cloud provider. Each virtual machine is equipped with GPUs of a single type: NVIDIA RTX A6000, NVIDIA H100, or NVIDIA RTX PRO 6000. The machines use the x86\_64 architecture with 60 online CPUs, AMD EPYC 9555 64-Core processors, 128 GB of RAM, and a 500 GB SSD. Running the full set of reported experiments takes approximately two full days.
