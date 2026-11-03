@@ -9,6 +9,8 @@ Variants, timed per draft step (all layers, CUDA graph replay):
   ours        fused cascade kernel, plan_for_draft + update_draft_step (E2E path)
   ours_pk     same, with pack_suffix=True (16 // GQA branches per suffix tile)
   fi          stock MultiLevelCascade: prefill(prefix) + prefill(suffix) + merge
+  paged       no prefix sharing (SGLang-style): CUDA-core decode, every branch
+              reads its full prefix + suffix
   split       proposed: prefill(prefix, topk*GQA packed rows) + CUDA-core
               decode(suffix, GQA rows per CTA, no padding) + merge
 Components: prefix prefill alone, suffix prefill vs suffix decode, merge.
@@ -70,7 +72,7 @@ def main():
 
     topk, D, hq, hkv, d, nl = args.topk, args.steps - 1, args.hq, args.hkv, args.d, args.layers
     ws = lambda: torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    fi_ws, pre_ws, dec_ws, sufp_ws = ws(), ws(), ws(), ws()
+    fi_ws, pre_ws, dec_ws, sufp_ws, pg_ws = ws(), ws(), ws(), ws(), ws()
     ones = lambda n: torch.ones(n, dtype=torch.int32)
     print(f"GPU: {torch.cuda.get_device_name()}  hq={hq} hkv={hkv} (GQA {hq // hkv}) d={d} "
           f"topk={topk} draft_steps={D} layers={nl}")
@@ -102,7 +104,7 @@ def main():
         pre.plan(h["qo0"], h["kv0"], shared, ones(bs), hq, hkv, d, 1, causal=False,
                  q_data_type=DTYPE, kv_data_type=DTYPE)
 
-        t = {k: 0.0 for k in ("ours", "ours_pk", "fi", "split", "prefix", "suf_prefill", "suf_decode", "merge")}
+        t = {k: 0.0 for k in ("ours", "ours_pk", "paged", "fi", "split", "prefix", "suf_prefill", "suf_decode", "merge")}
         max_err = 0.0
         for s in range(1, D + 1):
             hs = host_indptrs(bs, L, topk, s)
@@ -117,6 +119,12 @@ def main():
             dec = BatchDecodeWithPagedKVCacheWrapper(dec_ws, "NHD", use_tensor_cores=False)
             dec.plan(hs["kv1"], suf_idx, ones(nq), hq, hkv, d, 1,
                      q_data_type=DTYPE, kv_data_type=DTYPE)
+            # paged: branch b of request r reads prefix of r, then its own suffix
+            pre_r = shared.view(bs, L)
+            pg_idx = torch.cat([pre_r.repeat_interleave(topk, 0), unique[:, :s]], 1).reshape(-1)
+            pg = BatchDecodeWithPagedKVCacheWrapper(pg_ws, "NHD", use_tensor_cores=False)
+            pg.plan(torch.arange(nq + 1, dtype=torch.int32) * (L + s), pg_idx, ones(nq), hq, hkv, d, 1,
+                    q_data_type=DTYPE, kv_data_type=DTYPE)
             ours.update_draft_step(step_kv_len=s + 1, step_kv_end=s)
             ours_pk.update_draft_step(step_kv_len=s + 1, step_kv_end=s)
 
@@ -135,6 +143,7 @@ def main():
             o_ours, _ = ours.run(q, kvs[0])
             o_pk, lse_pk = ours_pk.run(q, kvs[0])
             max_err = max(max_err, (split(kvs[0]).float() - ref).abs().max().item(),
+                          (pg.run(q, kvs[0]).float() - ref).abs().max().item(),
                           (o_ours.float() - ref).abs().max().item(),
                           (o_pk.float() - ref).abs().max().item())
 
@@ -142,6 +151,7 @@ def main():
             it = args.iters
             t["ours"] += graph_time_us(layers(lambda kv: ours.run(q, kv)), it)
             t["ours_pk"] += graph_time_us(layers(lambda kv: ours_pk.run(q, kv)), it)
+            t["paged"] += graph_time_us(layers(lambda kv: pg.run(q, kv)), it)
             t["fi"] += graph_time_us(layers(lambda kv: fi.run(q, kv)), it)
             t["split"] += graph_time_us(layers(split), it)
             t["prefix"] += graph_time_us(
@@ -155,14 +165,14 @@ def main():
         rows.append((bs, L, ms, max_err))
         print(f"bs {bs:>3} prefix {L:>6}: " + "  ".join(f"{k} {v:.2f}" for k, v in ms.items())
               + f"  (max err {max_err:.1e})", flush=True)
-        del kvs, ours, ours_pk, pre, fi, sufp, dec
+        del kvs, ours, ours_pk, pre, fi, sufp, dec, pg
         torch.cuda.empty_cache()
 
     print("\nAttention ms per draft iteration (16 layers x 6 steps)")
-    print(f"{'bs':>3} {'prefix':>7} {'ours':>7} {'ours_pk':>7} {'fi':>7} {'split':>7} | {'prefix':>7} {'suf_pf':>7} "
+    print(f"{'bs':>3} {'prefix':>7} {'paged':>7} {'ours':>7} {'ours_pk':>7} {'fi':>7} {'split':>7} | {'prefix':>7} {'suf_pf':>7} "
           f"{'suf_dec':>7} {'merge':>7} | {'ours-prefix':>11}")
     for bs, L, m, _ in rows:
-        print(f"{bs:>3} {L:>7} {m['ours']:>7.2f} {m['ours_pk']:>7.2f} {m['fi']:>7.2f} {m['split']:>7.2f} | {m['prefix']:>7.2f} "
+        print(f"{bs:>3} {L:>7} {m['paged']:>7.2f} {m['ours']:>7.2f} {m['ours_pk']:>7.2f} {m['fi']:>7.2f} {m['split']:>7.2f} | {m['prefix']:>7.2f} "
               f"{m['suf_prefill']:>7.2f} {m['suf_decode']:>7.2f} {m['merge']:>7.2f} | "
               f"{m['ours'] - m['prefix']:>11.2f}")
 
