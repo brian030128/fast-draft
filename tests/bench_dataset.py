@@ -55,6 +55,7 @@ def create_engine(
     quantization=None,
     speculative_draft_model_quantization=None,
     kv_cache_dtype="auto",
+    cuda_graph_max_bs=None,
 ):
     """Create an sglang Engine with the given configuration."""
     from sglang.srt.entrypoints.engine import Engine
@@ -73,6 +74,11 @@ def create_engine(
         kwargs["mem_fraction_static"] = mem_fraction_static
     if quantization is not None:
         kwargs["quantization"] = quantization
+    if cuda_graph_max_bs is not None:
+        kwargs["cuda_graph_max_bs"] = cuda_graph_max_bs
+        # SGLang caps speculative decoding at 48 running requests unless set
+        # explicitly, which would also cap the captured graphs at 48.
+        kwargs["max_running_requests"] = cuda_graph_max_bs
 
     if draft_model_path is not None:
         kwargs["speculative_algorithm"] = speculative_algorithm
@@ -239,6 +245,7 @@ def run_phase(args, phase, records):
         quantization=getattr(args, "quantization", None),
         speculative_draft_model_quantization=getattr(args, "speculative_draft_model_quantization", None),
         kv_cache_dtype=getattr(args, "kv_cache_dtype", "auto"),
+        cuda_graph_max_bs=getattr(args, "cuda_graph_max_bs", None),
     )
 
     # Pre-tokenize all prompts and truncate to fit context_length - max_new_tokens
@@ -491,6 +498,10 @@ def add_common_args(parser):
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Number of prompts to submit per engine.generate() call")
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--cuda-graph-max-bs", type=int, default=None,
+                        help="Largest batch size captured in CUDA graphs (SGLang default: 32 on "
+                             "48 GB GPUs at tp < 4); set >= --batch-size for large batches. Also "
+                             "sets max_running_requests (SGLang's speculative default is 48)")
     parser.add_argument("--quantization", default=None,
                         help="Quantization for target model (e.g. fp8, w8a8_fp8, modelopt_fp8)")
     parser.add_argument("--speculative-draft-model-quantization", default=None,
