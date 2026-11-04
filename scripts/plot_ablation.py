@@ -65,6 +65,10 @@ def main():
     fig.tight_layout()
     fig.savefig(args.out)
     print(f"wrote {args.out}")
+    if args.out.endswith(".svg"):  # the paper includes the PDF (no Inkscape at compile time)
+        pdf = args.out[:-4] + ".pdf"
+        fig.savefig(pdf)
+        print(f"wrote {pdf}")
 
 
 if __name__ == "__main__":
