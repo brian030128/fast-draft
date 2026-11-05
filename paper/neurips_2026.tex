@@ -640,9 +640,7 @@ FastDraft consistently delivers the best end-to-end performance in all evaluated
 
 Table \ref{tab:batch-e2e} shows that FastDraft’s gains carry over to batched serving across different hardware settings. On NarrativeQA with a single RTX Pro 6000, FastDraft improves throughput over SGLang from 128.47 to 212.20 tokens/s at batch size 4 and from 131.42 to 226.16 tokens/s at batch size 8. On two A6000 GPUs, FastDraft improves throughput over SGLang from 103.97 to 193.18 tokens/s at batch size 4. Overall, FastDraft achieves up to 1.86$\times$ higher throughput over SGLang and up to 2.92$\times$ faster draft execution.
 
-Table~\ref{tab:speculative_decoding} reports decoding-time speedups, which isolate the phase that FastDraft accelerates; with long outputs, as in reasoning workloads, decoding dominates total latency. For completeness, Table~\ref{tab:e2e_with_prefill} in the appendix reports speedups of the full request latency including prefill for the A6000 settings. Because prefill takes 31--53\% of the autoregressive request time at these 10K--100K-token contexts with 512 output tokens, the ratios are smaller, but FastDraft remains the fastest method in every setting.
-
-All these results demonstrate that FastDraft is a practical drop-in acceleration for tree-based speculative decoding, whose end-to-end benefits arise from the combination of a structure-aware formulation and an efficient execution strategy.
+Table~\ref{tab:speculative_decoding} reports decoding-time speedups, the phase FastDraft accelerates. Table~\ref{tab:e2e_with_prefill} in the appendix reports full request latency including prefill, which takes 31--53\% of the autoregressive request time here; the ratios are smaller, but FastDraft remains the fastest method in every setting.
 
 \input{end2end_table}
 
