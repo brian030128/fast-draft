@@ -71,6 +71,14 @@ CUDA_VISIBLE_DEVICES=0 uv run python tests/bench_tree_attn.py \
     --head-configs 32:8 --num-prefixes 1,8 --topk 8,16 --prefix-lens 2048,8192,16384,32768
 ```
 
+## Tests
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run pytest tests/ -v
+```
+
+These compare the kernels and draft backends against reference implementations.
+
 ## Notes
 
 - The kernel's default tuning (`include/flashinfer/attention/cascade_tune.cuh`) was
